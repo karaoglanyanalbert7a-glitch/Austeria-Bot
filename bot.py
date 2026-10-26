@@ -24,7 +24,9 @@ from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, Error
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
 
+import analytics as an
 import db
+import scheduler as sch
 
 load_dotenv("settings.env")
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -34,6 +36,10 @@ DATA_DIR = os.getenv("DATA_DIR", "").strip()   # на хостинге это /a
 DB_PATH = os.getenv("DB_PATH", "").strip() or (os.path.join(DATA_DIR, "bot.db") if DATA_DIR else "bot.db")
 QUIZ_SIZE = int(os.getenv("QUIZ_SIZE", "5"))
 DAY_START_HOUR = int(os.getenv("DAY_START_HOUR", "5"))   # с этого часа начинается новый «день» бота
+SCHED = sch.Config(tz=TZ, day_start_hour=DAY_START_HOUR, remind_hour=int(os.getenv("REMIND_HOUR", "18")),
+                   digest_weekday=int(os.getenv("DIGEST_WEEKDAY", "0")), digest_hour=int(os.getenv("DIGEST_HOUR", "9")),
+                   teachers=TEACHERS)
+WEEKDAYS = ["понедельникам", "вторникам", "средам", "четвергам", "пятницам", "субботам", "воскресеньям"]
 QUESTIONS_FILE = "questions.xlsx"
 
 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
@@ -108,7 +114,10 @@ TEACHER_HELP = (
     "/hw — задания, кто сдал, закрыть задание\n"
     "/hwdone id ник — отметить выполненным (если приняли вне бота)\n"
     "/hwreset id ник — сбросить попытку ученика\n\n"
-    "<b>Данные</b>\n"
+    "<b>Аналитика и данные</b>\n"
+    "/digest — недельный дайджест сейчас\n"
+    "/flags — кому нужно внимание (пропали, падает точность, просрочки)\n"
+    "/export — Excel-файл со всей статистикой\n"
     "/backup — прислать резервную копию базы файлом\n\n"
     "<b>Контент</b>\n"
     "Пришлите файл .xlsx: загрузятся вопросы (лист questions) и памятки (лист cheatsheets).")
@@ -128,6 +137,7 @@ STUDENT_COMMANDS = [BotCommand(command="quiz", description="Начать кви�
 TEACHER_COMMANDS = [BotCommand(command="hw", description="Задания и кто сдал"),
                     BotCommand(command="newhw", description="Создать задание"),
                     BotCommand(command="students", description="Список учеников"),
+                    BotCommand(command="digest", description="Недельный дайджест"),
                     BotCommand(command="groups", description="Группы"),
                     BotCommand(command="admin", description="Все команды")]
 
@@ -234,7 +244,8 @@ async def register_student(tg_id, nick, state: FSMContext, message: Message):
         "🎯 <b>Квиз</b> — короткие вопросы каждый день: получаешь XP и растёшь по уровням от A1 до C1\n"
         "🔥 Заходи каждый день, чтобы не терять серию\n"
         "📖 <b>Памятки</b> — правила по темам\n"
-        "📝 <b>Домашка</b> — задания от учителя\n\n"
+        "📝 <b>Домашка</b> — задания от учителя\n"
+        "🔔 Иногда я буду напоминать о квизе и дедлайнах (отключить можно в «Профиле»)\n\n"
         "Нажми «🎯 Квиз», чтобы начать!", reply_markup=MENU_STUDENT)
 
 
@@ -296,6 +307,11 @@ def bar(cur, total, width=10):
     return "█" * filled + "░" * (width - filled)
 
 
+def profile_kb(remind):
+    return ikb([(f"🔔 Напоминания: {'включены ✅' if remind else 'выключены 🔕'}", "rem:toggle")],
+               [("✖️ Закрыть", "close")])
+
+
 @router.message(Command("profile"))
 @router.message(F.text == BTN_PROFILE)
 async def profile(m: Message):
@@ -317,7 +333,7 @@ async def profile(m: Message):
     daily = {"done": "✅ пройден", "started": "⏳ начат, можно закончить («🎯 Квиз»)",
              "none": "🎯 ждёт тебя"}[db.daily_status(con, u["id"], today())]
     lines += [f"📅 Квиз дня: {daily}", f"🪙 Монеты: {ch['coins']}",
-              f"🔥 Серия: {ch['streak']} дн. · ❄️ заморозок: {ch['freezes']}",
+              f"🔥 Серия: {db.effective_streak(ch, today())} дн. · ❄️ заморозок: {ch['freezes']}",
               f"\n📚 Словарь: {ch['vocabulary']} · 🧩 Грамматика: {ch['grammar']}\n"
               f"🎧 Аудирование: {ch['listening']} · 🗣 Говорение: {ch['speaking']}"]
     total = con.execute("SELECT COUNT(*), COALESCE(SUM(is_correct),0) FROM events "
@@ -325,7 +341,7 @@ async def profile(m: Message):
     if total[0]:
         lines.append(f"\n🎯 Точность: {round(100 * total[1] / total[0])}% (ответов: {total[0]})")
     db.log_event(con, u["id"], "profile_view", today())
-    await m.answer("\n".join(lines), reply_markup=ikb([("✖️ Закрыть", "close")]))
+    await m.answer("\n".join(lines), reply_markup=profile_kb(u["remind"]))
 
 
 @router.callback_query(F.data == "close")
@@ -452,25 +468,23 @@ async def send_question(bot: Bot, chat_id, state: FSMContext, note="", new=False
         await render_card(bot, chat_id, state, f"{head}\n\n✍️ Напиши ответ одним сообщением.", None, new=new)
 
 
-@router.message(Command("quiz"))
-@router.message(F.text == BTN_QUIZ)
-async def start_quiz(m: Message, state: FSMContext):
-    u = player(m.from_user.id)
-    await tidy(m)
+async def launch_quiz(bot: Bot, chat_id, tg_id, state: FSMContext):
+    """Запускает или продолжает квиз дня: кнопкой «Квиз» или кнопкой из напоминания."""
+    u = player(tg_id)
     if not u:
-        await m.answer("Сначала нажми /start")
+        await bot.send_message(chat_id, "Сначала нажми /start")
         return
     d = await state.get_data()
     if fresh(d) and d["pos"] < len(d["qids"]):  # незаконченный квиз сегодняшнего дня: продолжаем
         note = ("↩️ <i>Продолжаем незаконченную домашку</i>\n\n" if d.get("hw_id")
                 else "↩️ <i>Продолжаем незаконченный квиз</i>\n\n")
-        await send_question(m.bot, m.chat.id, state, note=note, new=True)
+        await send_question(bot, chat_id, state, note=note, new=True)
         return
-    await drop_card(m.bot, m.chat.id, d)  # вчерашняя карточка больше не нужна
+    await drop_card(bot, chat_id, d)  # вчерашняя карточка больше не нужна
     ch = db.get_character(con, u["id"])
     qs = db.pick_questions(con, u["id"], ch["level"], QUIZ_SIZE)
     if not qs:
-        await m.answer("Пока нет вопросов. Попроси учителя загрузить их 🙂")
+        await bot.send_message(chat_id, "Пока нет вопросов. Попроси учителя загрузить их 🙂")
         return
     ctx = "practice" if db.daily_started_today(con, u["id"], today()) else "daily"
     await state.set_state(None)
@@ -480,7 +494,40 @@ async def start_quiz(m: Message, state: FSMContext):
     db.log_event(con, u["id"], "quiz_start", today(), context=ctx)
     note = ("<i>Ежедневный квиз ты уже проходил(а): это дополнительная тренировка "
             "(XP меньше, но данные о прогрессе копятся) 💪</i>\n\n" if ctx == "practice" else "")
-    await send_question(m.bot, m.chat.id, state, note=note, new=True)
+    await send_question(bot, chat_id, state, note=note, new=True)
+
+
+@router.message(Command("quiz"))
+@router.message(F.text == BTN_QUIZ)
+async def start_quiz(m: Message, state: FSMContext):
+    await tidy(m)
+    await launch_quiz(m.bot, m.chat.id, m.from_user.id, state)
+
+
+@router.callback_query(F.data == "rem:quiz")
+async def reminder_quiz(cb: CallbackQuery, state: FSMContext):
+    """Кнопка «Начать квиз» в напоминании: убираем напоминание и сразу открываем квиз."""
+    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await launch_quiz(cb.bot, cb.message.chat.id, cb.from_user.id, state)
+
+
+@router.callback_query(F.data == "rem:toggle")
+async def reminder_toggle(cb: CallbackQuery):
+    u = player(cb.from_user.id)
+    if not u:
+        await cb.answer()
+        return
+    new = 0 if u["remind"] else 1
+    db.set_remind(con, u["id"], new)
+    await cb.answer("🔔 Напоминания включены" if new else "🔕 Напоминания выключены")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=profile_kb(new))
+    except TelegramBadRequest:
+        pass
 
 
 async def quiz_alive(cb: CallbackQuery, state: FSMContext, d: dict) -> bool:
@@ -904,6 +951,7 @@ async def t_tasks(m: Message, state: FSMContext):
 # ---------- сводка ----------
 def panel_content():
     s = db.teacher_overview(con, today())
+    flags = an.risk_flags(con, today())
     text = teacher_panel().rstrip() + "\n\nВсё управление — кнопками внизу. Команды с «/» тоже работают."
     tips = []
     if s["groups"] == 0:
@@ -917,9 +965,82 @@ def panel_content():
     rows = []
     if s["pending"]:
         rows.append([(f"📥 На проверке ({s['pending']})", "rv:list")])
+    if flags:
+        rows.append([(f"⚠️ Кому нужно внимание ({len(flags)})", "tp:flags")])
+    rows.append([("📬 Дайджест сейчас", "tp:digest"), ("📤 Экспорт в Excel", "tp:export")])
+    rows.append([("🔔 Автоматика", "tp:auto"), ("💾 Копия базы", "tp:backup")])
     rows.append([("⌨️ Команды", "tp:cmds"), ("📚 Загрузка вопросов", "tp:content")])
-    rows.append([("💾 Резервная копия базы", "tp:backup")])
     return text, ikb(*rows)
+
+
+def flags_content():
+    flags = an.risk_flags(con, today())
+    back = [("⬅️ Назад", "tp:home")]
+    if not flags:
+        return "✅ <b>Сигналов нет.</b> Все ученики занимаются в обычном режиме.", ikb(back)
+    names = {r["id"]: r["nickname"] for r in con.execute("SELECT id, nickname FROM users")}
+    lines = ["⚠️ <b>Кому нужно внимание</b>", ""]
+    lines += [f"• <b>{esc(names[uid])}</b> — {esc(an.flags_text(fl))}" for uid, fl in flags.items()]
+    lines.append("\nНажмите на ученика, чтобы открыть карточку, наградить или написать ему.")
+    return "\n".join(lines), ikb(*[[(names[uid], f"st:c:{uid}:all.0")] for uid in list(flags)[:25]], back)
+
+
+def auto_content():
+    def state(key):
+        return "✅ включены" if db.get_setting(con, key, "1") == "1" else "🔕 выключены"
+    off = con.execute("SELECT COUNT(*) FROM users WHERE role='student' AND is_active=1 AND remind=0").fetchone()[0]
+    text = ("🔔 <b>Автоматика</b>\n\n"
+            f"• <b>Напоминания ученикам:</b> {state('reminders')}. Каждый день в {SCHED.remind_hour}:00: о квизе "
+            "(тем, кто занимался в последние 3 дня, и тем, у кого есть серия) и о дедлайнах сегодня и завтра. "
+            "Если ученик 3 раза не ответил на напоминание, бот перестаёт напоминать, пока он не вернётся.\n"
+            f"• <b>Недельный дайджест вам:</b> {state('digest')}. По {WEEKDAYS[SCHED.digest_weekday]} в "
+            f"{SCHED.digest_hour}:00.\n"
+            f"• <b>Сигналы о проблемах:</b> {state('flags')}. Ежедневно в {SCHED.digest_hour}:00, только новые.\n\n"
+            f"Ученики, отключившие напоминания: {off}. Время меняется переменными REMIND_HOUR, DIGEST_WEEKDAY, "
+            "DIGEST_HOUR (см. DEPLOY.md).")
+    rows = [[(("🔕 Выключить" if db.get_setting(con, k, "1") == "1" else "🔔 Включить") + f" {name}", f"au:t:{k}")]
+            for k, name in (("reminders", "напоминания"), ("digest", "дайджест"), ("flags", "сигналы"))]
+    return text, ikb(*rows, [("⬅️ Назад", "tp:home")])
+
+
+@teacher.callback_query(F.data.startswith("au:t:"))
+async def auto_toggle(cb: CallbackQuery):
+    key = cb.data.split(":")[2]
+    if key in ("reminders", "digest", "flags"):
+        db.set_setting(con, key, "0" if db.get_setting(con, key, "1") == "1" else "1")
+    await cb.answer("Сохранено")
+    text, kb = auto_content()
+    await edit(cb, text, kb)
+
+
+async def send_digest_now(bot: Bot, chat_id):
+    for i, chunk in enumerate(an.split_text(an.build_digest(con, today()))):
+        await bot.send_message(chat_id, chunk)
+
+
+async def send_export(bot: Bot, chat_id):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, f"quest_bot_{today().isoformat()}.xlsx")
+        an.build_export(con, today(), path)
+        await bot.send_document(chat_id, FSInputFile(path), caption=(
+            "📤 Excel-файл: листы «Ученики», «Темы × ученики», «Динамика», «Журнал ответов» (все ответы за полгода) "
+            "и «Домашка». Откроется в Excel и в Google Таблицах (Файл → Импорт)."))
+
+
+@teacher.message(Command("digest"))
+async def t_digest(m: Message):
+    await send_digest_now(m.bot, m.chat.id)
+
+
+@teacher.message(Command("export"))
+async def t_export(m: Message):
+    await send_export(m.bot, m.chat.id)
+
+
+@teacher.message(Command("flags"))
+async def t_flags(m: Message):
+    text, kb = flags_content()
+    await m.answer(text, reply_markup=kb)
 
 
 async def send_backup(bot: Bot, chat_id):
@@ -946,8 +1067,22 @@ async def panel_nav(cb: CallbackQuery):
         await cb.answer("Отправляю файл…")
         await send_backup(cb.bot, cb.message.chat.id)
         return
+    if act == "digest":
+        await cb.answer("Формирую дайджест…")
+        await send_digest_now(cb.bot, cb.message.chat.id)
+        return
+    if act == "export":
+        await cb.answer("Собираю Excel…")
+        await send_export(cb.bot, cb.message.chat.id)
+        return
     await cb.answer()
-    if act == "cmds":
+    if act == "flags":
+        text, kb = flags_content()
+        await edit(cb, text, kb)
+    elif act == "auto":
+        text, kb = auto_content()
+        await edit(cb, text, kb)
+    elif act == "cmds":
         await edit(cb, TEACHER_HELP, ikb([("⬅️ Назад", "tp:home")]))
     elif act == "content":
         await edit(cb, CONTENT_HELP, ikb([("⬅️ Назад", "tp:home")]))
@@ -1018,9 +1153,12 @@ def student_card_content(uid, back):
     text = "\n".join([
         f"👤 <b>{esc(u['nickname'])}</b>" + (f" · группа {esc(r['grp'])}" if r["grp"] else " · без группы"),
         f"⭐ Уровень {ch['level']} ({db.cefr_for_level(ch['level'])}) · XP {ch['xp']} · 🪙 {ch['coins']}",
-        f"🔥 Серия: {ch['streak']} дн. · ❄️ заморозок: {ch['freezes']}",
+        f"🔥 Серия: {db.effective_streak(ch, today())} дн. · ❄️ заморозок: {ch['freezes']}",
         f"📅 Квиз дня: {daily}",
-        f"Был(а): {r['last_active_date'] or 'никогда'} · за 7 дней: ответов {r['n']}, верно {acc}"])
+        f"Последний ответ: {r['last_answer'] or 'никогда'} · за 7 дней: ответов {r['n']}, верно {acc}"])
+    fl = an.risk_flags(con, today(), user_id=uid).get(uid)
+    if fl:
+        text += "\n⚠️ " + esc(an.flags_text(fl))
     return text, ikb([("📈 Отчёт", f"st:r:{uid}:{back}"), ("🏷 Группа", f"st:g:{uid}:{back}")],
                      [("🎁 Наградить", f"rw:a:u{uid}:p"), ("⚠️ Штраф", f"rw:a:u{uid}:m")],
                      [("⬅️ К списку", f"st:l:c:{flt}:{page}")])
@@ -1359,7 +1497,7 @@ def student_report_text(u):
     grp = db.group_name(con, u["group_id"])
     lines = [f"<b>{esc(u['nickname'])}</b>" + (f" · группа {esc(grp)}" if grp else "")
              + f" — ур. {ch['level']} ({db.cefr_for_level(ch['level'])}), XP {ch['xp']}, 🪙 {ch['coins']}, "
-               f"серия {ch['streak']}",
+               f"серия {db.effective_streak(ch, today())}",
              f"Дней с активностью за 14 дней: {db.active_days(con, u['id'], since)}"]
     started, finished = db.quiz_counts(con, u["id"], since)
     lines.append(f"Квизы за 14 дней: начато {started}, закончено {finished}"
@@ -1378,6 +1516,9 @@ def student_report_text(u):
         lines += [f"• {esc(r['k'])}: {r['n']}" for r in memos]
     if len(lines) == base:
         lines.append("\nОтветов пока нет.")
+    dyn = an.weekly_lines(con, today(), user_id=u["id"])
+    if dyn:
+        lines += ["", "<b>Динамика по неделям (точность)</b>", "<pre>" + "\n".join(dyn) + "</pre>"]
     return "\n".join(lines)
 
 
@@ -1393,9 +1534,12 @@ def group_report_text(g):
     else:
         lines.append("\nОтветов за 14 дней пока нет.")
     cutoff = (today() - timedelta(days=4)).isoformat()
-    quiet = [r["nickname"] for r in members if not r["last_active_date"] or r["last_active_date"] < cutoff]
+    quiet = [r["nickname"] for r in members if not r["last_answer"] or r["last_answer"] < cutoff]
     if quiet:
         lines.append("\n⚠️ <b>Не заходили 5+ дней:</b> " + ", ".join(esc(n) for n in quiet))
+    dyn = an.weekly_lines(con, today(), group_id=g["id"])
+    if dyn:
+        lines += ["", "<b>Динамика группы по неделям (точность)</b>", "<pre>" + "\n".join(dyn) + "</pre>"]
     return "\n".join(lines)
 
 
@@ -1470,8 +1614,8 @@ async def students(m: Message):
     for r in rows:
         acc = f"{round(100 * r['ok'] / r['n'])}%" if r["n"] else "—"
         lines.append(f"• <b>{esc(r['nickname'])}</b>" + (f" [{esc(r['grp'])}]" if r["grp"] and not g else "")
-                     + f" — ур. {r['level']} ({db.cefr_for_level(r['level'])}), 🔥{r['streak']}, "
-                       f"был(а): {r['last_active_date'] or 'никогда'}, ответов: {r['n']}, верно: {acc}")
+                     + f" — ур. {r['level']} ({db.cefr_for_level(r['level'])}), 🔥{db.effective_streak(r, today())}, "
+                       f"ответ: {r['last_answer'] or 'никогда'}, ответов: {r['n']}, верно: {acc}")
     await send_long(m, "\n".join(lines))
 
 
@@ -2121,8 +2265,14 @@ async def main():
     startup_import()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_commands(bot)
+    scheduler_task = asyncio.create_task(sch.run(bot, con, SCHED))   # напоминания, дайджест, сигналы
+    print(f"Автоматика: напоминания в {SCHED.remind_hour}:00, дайджест по {WEEKDAYS[SCHED.digest_weekday]} "
+          f"в {SCHED.digest_hour}:00")
     print("Бот запущен. Остановить: Ctrl+C")
-    await make_dispatcher().start_polling(bot)
+    try:
+        await make_dispatcher().start_polling(bot)
+    finally:
+        scheduler_task.cancel()
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS groups (
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE NOT NULL, nickname TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'student', group_id INTEGER REFERENCES groups(id),
-    is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+    is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, remind INTEGER NOT NULL DEFAULT 1);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_users_nick ON users(nickname COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS characters (
     user_id INTEGER PRIMARY KEY REFERENCES users(id),
@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS homework_status (
     late INTEGER NOT NULL DEFAULT 0, submitted_at TEXT, completed_at TEXT, teacher_comment TEXT,
     sub_chat INTEGER, sub_msg INTEGER,
     PRIMARY KEY (homework_id, user_id));
+CREATE TABLE IF NOT EXISTS job_runs (
+    job TEXT NOT NULL, key TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY (job, key));
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cheatsheets (
     id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT UNIQUE NOT NULL, cefr TEXT, text TEXT NOT NULL);
 """
@@ -77,6 +80,8 @@ def connect(path):
     for name in ("sub_chat", "sub_msg"):
         if name not in cols:
             con.execute(f"ALTER TABLE homework_status ADD COLUMN {name} INTEGER")
+    if "remind" not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
+        con.execute("ALTER TABLE users ADD COLUMN remind INTEGER NOT NULL DEFAULT 1")
     con.commit()
     return con
 
@@ -443,7 +448,8 @@ def adjust(con, user_id, kind, amount, reason, given_by, day):
 
 # ---------- аналитика для учителя ----------
 def students_overview(con, since_day, group_id=None, user_id=None):
-    sql = """SELECT u.id, u.nickname, u.group_id, g.name AS grp, c.level, c.streak, c.last_active_date,
+    sql = """SELECT u.id, u.nickname, u.group_id, g.name AS grp, c.level, c.streak, c.freezes, c.last_active_date,
+             (SELECT MAX(e.day) FROM events e WHERE e.user_id=u.id AND e.event_type='answer') AS last_answer,
              (SELECT COUNT(*) FROM events e WHERE e.user_id=u.id AND e.event_type='answer' AND e.day>=?) AS n,
              (SELECT COALESCE(SUM(is_correct),0) FROM events e WHERE e.user_id=u.id
                  AND e.event_type='answer' AND e.day>=?) AS ok
@@ -662,3 +668,40 @@ def make_teacher(con, user_id):
     con.execute("UPDATE users SET role='teacher', group_id=NULL WHERE id=?", (user_id,))
     con.execute("DELETE FROM characters WHERE user_id=?", (user_id,))
     con.commit()
+
+
+# ---------- фоновые задачи: чтобы после перезапуска ничего не отправлялось повторно ----------
+def job_done(con, job, key):
+    return con.execute("SELECT 1 FROM job_runs WHERE job=? AND key=?", (job, key)).fetchone() is not None
+
+
+def job_mark(con, job, key):
+    con.execute("INSERT OR IGNORE INTO job_runs (job, key, ts) VALUES (?,?,?)", (job, key, utc_now()))
+    con.commit()
+
+
+def get_setting(con, key, default="1"):
+    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(con, key, value):
+    con.execute("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)))
+    con.commit()
+
+
+def set_remind(con, user_id, flag):
+    con.execute("UPDATE users SET remind=? WHERE id=?", (1 if flag else 0, user_id))
+    con.commit()
+
+
+def effective_streak(ch, today):
+    """Серия, которую ученик реально имеет сейчас. Сохранённое число обновляется только после квиза,
+    поэтому у пропавшего ученика оно устаревает: считаем сгоревшую серию нулём."""
+    if not ch["last_active_date"]:
+        return 0
+    gap = (today - date.fromisoformat(ch["last_active_date"])).days
+    if gap <= 1 or (gap == 2 and ch["freezes"] > 0):
+        return ch["streak"]
+    return 0
