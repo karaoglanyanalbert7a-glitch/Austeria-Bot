@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from html import escape as esc
 from zoneinfo import ZoneInfo
 
+from collections import Counter
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -68,6 +70,7 @@ class NewHW(StatesGroup):      # мастер создания задания (�
     title = State()
     desc = State()
     comment = State()
+    search = State()
 
 
 class Submit(StatesGroup):     # ученик сдаёт авторское задание
@@ -117,6 +120,7 @@ TEACHER_HELP = (
     "<b>Аналитика и данные</b>\n"
     "/digest — недельный дайджест сейчас\n"
     "/flags — кому нужно внимание (пропали, падает точность, просрочки)\n"
+    "/mistakes — типичные ошибки (какие вопросы валят и какой ответ выбирают)\n"
     "/export — Excel-файл со всей статистикой\n"
     "/backup — прислать резервную копию базы файлом\n\n"
     "<b>Контент</b>\n"
@@ -354,12 +358,16 @@ async def close_message(cb: CallbackQuery):
 
 
 # ======================= памятки =======================
-def memo_list_content():
+def memo_list_content(page=0):
     sheets = db.list_cheatsheets(con)
     if not sheets:
         return "Памяток пока нет. Скоро появятся 🙂", None
-    return "📖 <b>Памятки.</b> Выбери тему:", ikb(*[
-        [(f"{s['topic']} · {s['cefr']}" if s["cefr"] else s["topic"], f"memo:{s['id']}")] for s in sheets])
+    pages = max(1, -(-len(sheets) // PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = [[(f"{x['topic'][:45]} · {x['cefr']}" if x["cefr"] else x["topic"][:50], f"memo:{x['id']}:{page}")]
+            for x in sheets[page * PAGE:(page + 1) * PAGE]]
+    rows += nav_row(page, pages, "memo:list")
+    return "📖 <b>Памятки.</b> Выбери тему:" + (f" (страница {page + 1} из {pages})" if pages > 1 else ""), ikb(*rows)
 
 
 @router.message(Command("memo"))
@@ -376,10 +384,11 @@ async def memo_list(m: Message):
 
 @router.callback_query(F.data.startswith("memo:"))
 async def memo_show(cb: CallbackQuery):
-    key = cb.data.split(":")[1]
+    p = cb.data.split(":")
+    key, page = p[1], (int(p[2]) if len(p) > 2 else 0)
     await cb.answer()
     if key == "list":
-        text, kb = memo_list_content()
+        text, kb = memo_list_content(page)
         await edit(cb, text, kb)
         return
     s, u = db.get_cheatsheet(con, int(key)), player(cb.from_user.id)
@@ -388,7 +397,7 @@ async def memo_show(cb: CallbackQuery):
     db.log_event(con, u["id"], "cheatsheet_view", today(), topic=s["topic"])
     text = f"📖 <b>{esc(s['topic'])}</b>\n\n{memo_html(s['text'])}"
     if len(text) <= 3900:
-        await edit(cb, text, ikb([("⬅️ К списку", "memo:list")]))
+        await edit(cb, text, ikb([("⬅️ К списку", f"memo:list:{page}")]))
     else:
         await send_long(cb.message, text)
 
@@ -601,8 +610,9 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
     ok = db.check_answer(q, given)
     ctx = d["context"]
     gain, coins = db.apply_answer(con, u["id"], ok, ctx, q["skill"])
+    chosen = q["option_" + given] if q["type"] == "choice" else given.strip()[:80]   # что именно ответил ученик
     db.log_event(con, u["id"], "answer", today(), question_id=q["id"], topic=q["topic"], skill=q["skill"],
-                 cefr=q["cefr"], is_correct=int(ok), response_time_ms=ms, context=ctx)
+                 cefr=q["cefr"], is_correct=int(ok), response_time_ms=ms, context=ctx, answer_given=chosen)
     if d.get("hw_id"):
         db.hw_record_answer(con, d["hw_id"], u["id"], q["id"], ok)
     d2 = {**d, "correct": d["correct"] + int(ok), "xp": d["xp"] + gain, "coins": d["coins"] + coins}
@@ -952,7 +962,10 @@ async def t_tasks(m: Message, state: FSMContext):
 def panel_content():
     s = db.teacher_overview(con, today())
     flags = an.risk_flags(con, today())
-    text = teacher_panel().rstrip() + "\n\nВсё управление — кнопками внизу. Команды с «/» тоже работают."
+    text = teacher_panel().rstrip()
+    if s["students"]:
+        text += "\n" + an.status_line(an.student_status(con, today()))
+    text += "\n\nВсё управление — кнопками внизу. Команды с «/» тоже работают."
     tips = []
     if s["groups"] == 0:
         tips.append("1️⃣ Создайте группу: «🏷 Группы» → «➕ Создать группу».")
@@ -967,9 +980,10 @@ def panel_content():
         rows.append([(f"📥 На проверке ({s['pending']})", "rv:list")])
     if flags:
         rows.append([(f"⚠️ Кому нужно внимание ({len(flags)})", "tp:flags")])
-    rows.append([("📬 Дайджест сейчас", "tp:digest"), ("📤 Экспорт в Excel", "tp:export")])
-    rows.append([("🔔 Автоматика", "tp:auto"), ("💾 Копия базы", "tp:backup")])
-    rows.append([("⌨️ Команды", "tp:cmds"), ("📚 Загрузка вопросов", "tp:content")])
+    rows.append([("📬 Дайджест сейчас", "tp:digest"), ("🧩 Типичные ошибки", "ms:a:0")])
+    rows.append([("📤 Экспорт в Excel", "tp:export"), ("🔔 Автоматика", "tp:auto")])
+    rows.append([("💾 Копия базы", "tp:backup"), ("⌨️ Команды", "tp:cmds")])
+    rows.append([("📚 Загрузка вопросов", "tp:content")])
     return text, ikb(*rows)
 
 
@@ -1132,13 +1146,14 @@ def students_list_content(mode, flt, page):
     pages = max(1, -(-len(rows_) // PAGE))
     page = max(0, min(page, pages - 1))
     kb = []
+    status = an.student_status(con, today())
     for r in rows_[page * PAGE:(page + 1) * PAGE]:
         tag = f" [{r['grp']}]" if flt == "all" and r["grp"] else ""
         cb = f"st:c:{r['id']}:{flt}.{page}" if mode == "c" else f"rw:u:{r['id']}"
-        kb.append([(f"{r['nickname']}{tag} · ур. {r['level']}", cb)])
+        kb.append([(f"{status[r['id']]['icon']} {r['nickname']}{tag} · ур. {r['level']}", cb)])
     kb += nav_row(page, pages, f"st:l:{mode}:{flt}")
     kb += back
-    return f"{head} ({len(rows_)})", ikb(*kb)
+    return f"{head} ({len(rows_)})\n{an.LEGEND}", ikb(*kb)
 
 
 def student_card_content(uid, back):
@@ -1156,10 +1171,10 @@ def student_card_content(uid, back):
         f"🔥 Серия: {db.effective_streak(ch, today())} дн. · ❄️ заморозок: {ch['freezes']}",
         f"📅 Квиз дня: {daily}",
         f"Последний ответ: {r['last_answer'] or 'никогда'} · за 7 дней: ответов {r['n']}, верно {acc}"])
-    fl = an.risk_flags(con, today(), user_id=uid).get(uid)
-    if fl:
-        text += "\n⚠️ " + esc(an.flags_text(fl))
-    return text, ikb([("📈 Отчёт", f"st:r:{uid}:{back}"), ("🏷 Группа", f"st:g:{uid}:{back}")],
+    stt = an.student_status(con, today(), user_id=uid)[uid]
+    text += f"\n🚦 {stt['icon']} {esc(stt['reason'])}"
+    return text, ikb([("📈 Отчёт", f"st:r:{uid}:{back}"), ("🗺 Карта тем", f"mp:s:{uid}:{back}:0")],
+                     [("🧩 Ошибки ученика", f"ms:u{uid}:0"), ("🏷 Группа", f"st:g:{uid}:{back}")],
                      [("🎁 Наградить", f"rw:a:u{uid}:p"), ("⚠️ Штраф", f"rw:a:u{uid}:m")],
                      [("⬅️ К списку", f"st:l:c:{flt}:{page}")])
 
@@ -1201,6 +1216,102 @@ async def students_nav(cb: CallbackQuery):
     await edit(cb, text, kb)
 
 
+# ---------- карта освоения тем и типичные ошибки ----------
+MAP_PAGE = 10
+
+
+def student_map_content(uid, page, back):
+    u = user_by_id(uid)
+    items = an.student_map(con, uid)
+    flt, bpage = back.split(".")
+    back_kb = [("⬅️ К карточке", f"st:c:{uid}:{back}")]
+    if not u or not items:
+        return f"🗺 <b>Карта тем · {esc(u['nickname']) if u else '?'}</b>\n\nОтветов по темам пока нет.", ikb(back_kb)
+    cnt = Counter(x["state"] for x in items)
+    pages = max(1, -(-len(items) // MAP_PAGE))
+    page = max(0, min(page, pages - 1))
+    lines = [f"🗺 <b>Карта тем · {esc(u['nickname'])}</b>",
+             f"🔴 проблемы: {cnt['problem']} · 🟡 в процессе: {cnt['progress']} · 🟢 освоено: {cnt['mastered']}",
+             "<i>Состояние темы считается по последним 10 ответам. Сверху самые проблемные.</i>", ""]
+    for x in items[page * MAP_PAGE:(page + 1) * MAP_PAGE]:
+        lines.append(f"{an.MASTERY_ICON[x['state']]} {esc(x['topic'][:50])} — {x['acc']}% ({x['ok']}/{x['n']}), "
+                     f"всего ответов {x['total']}")
+    return "\n".join(lines), ikb(*nav_row(page, pages, f"mp:s:{uid}:{back}"), back_kb)
+
+
+def group_map_content(gid, page):
+    g = group_by_id(gid)
+    if not g:
+        return "Группа не найдена.", None
+    rows = an.group_map(con, gid)
+    back_kb = [("⬅️ К группе", f"gr:c:{gid}")]
+    if not rows:
+        return f"🗺 <b>Карта группы · {esc(g['name'])}</b>\n\nОтветов по темам пока нет.", ikb(back_kb)
+    pages = max(1, -(-len(rows) // MAP_PAGE))
+    page = max(0, min(page, pages - 1))
+    lines = [f"🗺 <b>Карта группы · {esc(g['name'])}</b>",
+             f"Тем с ответами: {len(rows)}. Сверху те, где больше всего проблем.",
+             "<i>🔴 проблема · 🟡 в процессе · 🟢 освоено: сколько учеников в каждом состоянии</i>", ""]
+    for r in rows[page * MAP_PAGE:(page + 1) * MAP_PAGE]:
+        who = f" — {esc(', '.join(r['problem_names'][:3]))}" + ("…" if len(r["problem_names"]) > 3 else "") \
+            if r["problem"] else ""
+        lines.append(f"{esc(r['topic'][:45])}: 🔴{r['problem']} 🟡{r['progress']} 🟢{r['mastered']}{who}")
+    return "\n".join(lines), ikb(*nav_row(page, pages, f"mp:g:{gid}"), back_kb)
+
+
+MIST_PAGE = 5
+
+
+def mistakes_content(scope, page):
+    """scope: a — все ученики, g<id> — группа, u<id> — ученик."""
+    kind, ident = scope[0], (int(scope[1:]) if len(scope) > 1 else None)
+    since = today() - timedelta(days=13)
+    if kind == "g":
+        items, label, back = an.common_mistakes(con, since, group_id=ident, limit=50), \
+            f"группа {esc((group_by_id(ident) or {'name': '?'})['name'])}", f"gr:c:{ident}"
+    elif kind == "u":
+        u = user_by_id(ident)
+        items, label, back = an.common_mistakes(con, since, user_id=ident, limit=50, min_wrong=2), \
+            f"{esc(u['nickname']) if u else '?'}", f"st:c:{ident}:all.0"
+    else:
+        items, label, back = an.common_mistakes(con, since, limit=50), "все ученики", "tp:home"
+    back_kb = [("⬅️ Назад", back)]
+    head = f"🧩 <b>Типичные ошибки · {label}</b> (14 дней)"
+    if not items:
+        return head + "\n\nПока нет вопросов, на которых ошиблись " + ("2+" if kind == "u" else "3+") + " раза.", ikb(back_kb)
+    pages = max(1, -(-len(items) // MIST_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * MIST_PAGE:(page + 1) * MIST_PAGE]
+    text = f"{head}\n<i>Вопросы с наибольшим числом ошибок и самый частый неверный ответ.</i>\n\n" \
+           + an.mistakes_text(chunk, start=page * MIST_PAGE + 1)
+    return text, ikb(*nav_row(page, pages, f"ms:{scope}"), back_kb)
+
+
+@teacher.callback_query(F.data.startswith("mp:"))
+async def map_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    await cb.answer()
+    if p[1] == "s":      # mp:s:<uid>:<back>:<page>
+        text, kb = student_map_content(int(p[2]), int(p[4]), p[3])
+    else:                # mp:g:<gid>:<page>
+        text, kb = group_map_content(int(p[2]), int(p[3]))
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data.startswith("ms:"))
+async def mistakes_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    await cb.answer()
+    text, kb = mistakes_content(p[1], int(p[2]))
+    await edit(cb, text, kb)
+
+
+@teacher.message(Command("mistakes"))
+async def t_mistakes(m: Message):
+    text, kb = mistakes_content("a", 0)
+    await m.answer(text, reply_markup=kb)
+
+
 # ---------- группы ----------
 def groups_list_content():
     gs = db.groups_overview(con)
@@ -1218,11 +1329,14 @@ def group_card_content(gid, note=""):
     if not g:
         return "Группа не найдена.", None
     members = db.group_students(con, gid)
-    names = ", ".join(esc(u["nickname"]) for u in members[:20]) + ("…" if len(members) > 20 else "")
+    status = an.student_status(con, today())
+    names = ", ".join(f"{status[u['id']]['icon']}{esc(u['nickname'])}" for u in members[:20]) \
+        + ("…" if len(members) > 20 else "")
     text = (f"{note}🏷 <b>{esc(g['name'])}</b>" + (f" · цель {g['target_cefr']}" if g["target_cefr"] else "")
             + f"\nУчеников: {len(members)}" + (f"\n{names}" if members else ""))
     return text, ikb(
         [("👥 Состав", f"st:l:c:g{gid}:0"), ("📈 Отчёт", f"gr:rep:{gid}")],
+        [("🗺 Карта группы", f"mp:g:{gid}:0"), ("🧩 Типичные ошибки", f"ms:g{gid}:0")],
         [("➕ Добавить учеников", f"gr:addn:{gid}"), ("🎁 Наградить группу", f"rw:a:g{gid}:p")],
         [("📝 Задание группе", f"nhw:preg:{gid}"), ("🎯 Уровень", f"gr:lvl:{gid}")],
         [("✏️ Название", f"gr:ren:{gid}"), ("🗑 Удалить", f"gr:del:{gid}")],
@@ -1491,6 +1605,13 @@ def rest_of(m: Message):
     return " ".join(parts[1].split()) if len(parts) > 1 else ""
 
 
+def capped(lines_, limit=10):
+    """Длинные списки тем урезаем: остальное видно в «Карте тем» и в Excel."""
+    if len(lines_) <= limit:
+        return lines_
+    return lines_[:limit] + [f"…и ещё {len(lines_) - limit} (полный список: «🗺 Карта тем» и Excel)"]
+
+
 def student_report_text(u):
     ch = db.get_character(con, u["id"])
     since = (today() - timedelta(days=13)).isoformat()
@@ -1509,11 +1630,12 @@ def student_report_text(u):
         rows = db.accuracy_by(con, u["id"], col)
         if rows:
             lines.append(f"\n<b>{title}</b>")
-            lines += [f"• {esc(str(r['k']))}: {round(100 * r['ok'] / r['n'])}% ({r['ok']}/{r['n']})" for r in rows]
+            lines += capped([f"• {esc(str(r['k']))}: {round(100 * r['ok'] / r['n'])}% ({r['ok']}/{r['n']})"
+                             for r in rows])
     memos = db.memo_views(con, u["id"], since)
     if memos:
         lines.append("\n<b>Открывал памятки (14 дней)</b>")
-        lines += [f"• {esc(r['k'])}: {r['n']}" for r in memos]
+        lines += capped([f"• {esc(r['k'])}: {r['n']}" for r in memos], 6)
     if len(lines) == base:
         lines.append("\nОтветов пока нет.")
     dyn = an.weekly_lines(con, today(), user_id=u["id"])
@@ -1530,7 +1652,8 @@ def group_report_text(g):
     topics = db.group_topic_accuracy(con, g["id"], since)
     if topics:
         lines.append("\n<b>Темы группы за 14 дней (от слабых к сильным)</b>")
-        lines += [f"• {esc(str(r['k']))}: {round(100 * r['ok'] / r['n'])}% ({r['ok']}/{r['n']})" for r in topics]
+        lines += capped([f"• {esc(str(r['k']))}: {round(100 * r['ok'] / r['n'])}% ({r['ok']}/{r['n']})"
+                         for r in topics])
     else:
         lines.append("\nОтветов за 14 дней пока нет.")
     cutoff = (today() - timedelta(days=4)).isoformat()
@@ -1825,21 +1948,87 @@ async def nhw_group(cb: CallbackQuery, state: FSMContext):
     await edit(cb, "Напишите <b>название</b> задания (например: «Past Simple, неделя 3»).")
 
 
+LEVEL_CHIPS = ["Все", "A1", "A2", "B1", "B2", "C1"]
+
+
+def topic_picker_content(d, page):
+    """Тем в банке могут быть сотни: показываем по 8 с листанием, поиском по названию и фильтром по уровню."""
+    cefr, query = d.get("tf"), d.get("tq")
+    topics = db.topic_stats(con, cefr, query)
+    pages = max(1, -(-len(topics) // PAGE))
+    page = max(0, min(page, pages - 1))
+    info = []
+    if cefr:
+        info.append(f"уровень {cefr}")
+    if query:
+        info.append(f"поиск «{esc(query)}»")
+    text = (f"📚 <b>Тема для теста</b>\nТем найдено: {len(topics)}" + (f" ({', '.join(info)})" if info else "")
+            + (f" · страница {page + 1} из {pages}" if pages > 1 else "")
+            + ("\nНичего не найдено: измените поиск или уровень." if not topics else ""))
+    rows = [[((f"✔️ {c}" if (cefr or "Все") == c else c), f"nhw:tl:{c}") for c in LEVEL_CHIPS]]
+    rows.append([("🔎 Найти по названию", "nhw:ts")] + ([("✖️ Сбросить поиск", "nhw:tc")] if query else []))
+    rows.append([("🎲 Любая тема" + (f" ({cefr})" if cefr else " (весь банк)"), "nhw:topic:any")])
+    rows += [[(f"{t[:42]} · {n}", f"nhw:topic:{db.topic_key(t)}")] for t, n in topics[page * PAGE:(page + 1) * PAGE]]
+    rows += nav_row(page, pages, "nhw:tp")
+    rows.append([("❌ Отмена", "nhw:cancel")])
+    return text, ikb(*rows)
+
+
+@teacher.callback_query(F.data.startswith("nhw:tp:"))
+async def nhw_topic_page(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    text, kb = topic_picker_content(await state.get_data(), int(cb.data.split(":")[2]))
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data.startswith("nhw:tl:"))
+async def nhw_topic_level(cb: CallbackQuery, state: FSMContext):
+    level = cb.data.split(":")[2]
+    await state.update_data(tf=None if level == "Все" else level)
+    await cb.answer()
+    text, kb = topic_picker_content(await state.get_data(), 0)
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data == "nhw:tc")
+async def nhw_topic_clear(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(tq=None)
+    await cb.answer()
+    text, kb = topic_picker_content(await state.get_data(), 0)
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data == "nhw:ts")
+async def nhw_topic_search(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(NewHW.search)
+    await state.update_data(prompt_id=cb.message.message_id)
+    await cb.answer()
+    await edit(cb, "🔎 Напишите часть названия темы (например, «past» или «артикл»).",
+               ikb([("⬅️ Назад к списку", "nhw:tp:0")]))
+
+
+@teacher.message(NewHW.search, F.text, ~F.text.startswith("/"))
+async def nhw_topic_search_input(m: Message, state: FSMContext):
+    await tidy(m)
+    await state.update_data(tq=m.text.strip()[:40])
+    await state.set_state(None)
+    text, kb = topic_picker_content(await state.get_data(), 0)
+    await edit_prompt(m.bot, m.chat.id, state, text, kb)
+
+
 @teacher.message(NewHW.title, F.text, ~F.text.startswith("/"))
 async def nhw_title(m: Message, state: FSMContext):
     await state.update_data(title=m.text.strip()[:80])
     d = await state.get_data()
     if d.get("kind") == "quiz":
-        topics = db.list_topics(con)
-        if not topics:
+        if not db.topic_stats(con):
             await state.clear()
             await m.answer("В банке пока нет вопросов. Загрузите таблицу с вопросами.")
             return
-        await state.update_data(topics=topics)
+        await state.update_data(tf=None, tq=None)
         await state.set_state(None)
-        rows = [[(t, f"nhw:topic:{i}")] for i, t in enumerate(topics)]
-        rows.append([("Любая тема (весь банк)", "nhw:topic:any")])
-        await m.answer("Из какой темы вопросы?", reply_markup=ikb(*rows))
+        text, kb = topic_picker_content({}, 0)
+        await m.answer(text, reply_markup=kb)
     else:
         await state.set_state(NewHW.desc)
         await m.answer("Напишите <b>условие</b> задания: что именно нужно сделать и как сдать.")
@@ -1856,14 +2045,29 @@ async def nhw_desc(m: Message, state: FSMContext):
 async def nhw_topic(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     key = cb.data.split(":")[2]
-    await state.update_data(topic=None if key == "any" else d["topics"][int(key)])
+    topic = None
+    if key != "any":
+        topic = db.topic_by_key(con, key)
+        if topic is None:
+            await cb.answer("Тема не найдена (таблица могла обновиться). Откройте список заново.", show_alert=True)
+            return
+    cefr = d.get("tf")
+    avail = db.count_questions(con, topic, cefr)
+    if not avail:
+        await cb.answer("В этой теме нет активных вопросов выбранного уровня.", show_alert=True)
+        return
+    await state.update_data(topic=topic, hw_cefr=cefr, avail=avail)
     await cb.answer()
-    await edit(cb, "Сколько вопросов?", ikb([(str(n), f"nhw:cnt:{n}") for n in (5, 10, 15, 20)]))
+    options = [n for n in (5, 10, 15, 20, 30) if n < avail]
+    buttons = [(str(n), f"nhw:cnt:{n}") for n in options] + [(f"Все ({avail})" if avail <= 60 else "60", f"nhw:cnt:{min(avail, 60)}")]
+    await edit(cb, f"Тема: <b>{esc(topic) if topic else 'весь банк'}</b>" + (f" · уровень {cefr}" if cefr else "")
+               + f"\nДоступно вопросов: {avail}. Сколько взять в тест?", ikb(buttons[:6], [("⬅️ Другая тема", "nhw:tp:0")]))
 
 
 @teacher.callback_query(F.data.startswith("nhw:cnt:"))
 async def nhw_count(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(count=int(cb.data.split(":")[2]))
+    d = await state.get_data()
+    await state.update_data(count=min(int(cb.data.split(":")[2]), d.get("avail") or 60))
     await cb.answer()
     await edit(cb, "Дедлайн?", due_kb())
 
@@ -1879,7 +2083,8 @@ async def nhw_due(cb: CallbackQuery, state: FSMContext):
     lines = ["<b>Проверьте задание:</b>", f"Тип: {'тест из банка' if d['kind'] == 'quiz' else 'авторское'}",
              f"Кому: {esc(who)}", f"Название: {esc(d['title'])}"]
     if d["kind"] == "quiz":
-        lines.append(f"Тема: {esc(d['topic']) if d.get('topic') else 'весь банк'}, вопросов: {d['count']}")
+        lines.append(f"Тема: {esc(d['topic']) if d.get('topic') else 'весь банк'}"
+                     + (f", уровень {d['hw_cefr']}" if d.get("hw_cefr") else "") + f", вопросов: {d['count']}")
     else:
         lines.append(f"Условие: {esc(d['description'])}")
     lines.append(f"Срок: {fmt_due(due)}")
@@ -1897,7 +2102,7 @@ async def nhw_create(cb: CallbackQuery, state: FSMContext, bot: Bot):
     t = player(cb.from_user.id)
     qids = []
     if d["kind"] == "quiz":
-        qids = db.pick_homework_questions(con, d.get("topic"), d["count"])
+        qids = db.pick_homework_questions(con, d.get("topic"), d["count"], d.get("hw_cefr"))
         if not qids:
             await edit(cb, "По этой теме нет активных вопросов. Выберите другую: /newhw")
             return
@@ -2182,9 +2387,14 @@ async def on_document(m: Message, bot: Bot):
             await m.answer(f"Не удалось прочитать файл: {esc(str(e))}")
             return
     problems = q_prob + c_prob
-    text = f"✅ Загружено вопросов: {q_ok}, памяток: {c_ok}"
+    text = f"✅ Загружено вопросов: {q_ok}, памяток: {c_ok}. Тем в банке: {len(db.topic_stats(con))}"
     if problems:
         text += f"\n⚠️ Пропущено строк: {len(problems)}\n" + "\n".join(esc(p) for p in problems[:15])
+    similar = db.similar_topics(con)
+    if similar:
+        text += ("\n\n⚠️ <b>Похожие названия тем</b> (отличаются регистром или пробелами, бот считает их разными, "
+                 "возможно, опечатка):\n" + "\n".join("• " + " / ".join(f"«{esc(t)}»" for t in grp)
+                                                         for grp in similar[:6]))
     await m.answer(text)
 
 

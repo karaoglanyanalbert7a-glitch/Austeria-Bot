@@ -1,4 +1,5 @@
 """База данных и игровая логика (без Telegram). Всё, что делает ученик, пишется в таблицу events."""
+import hashlib
 import json
 import random
 import re
@@ -42,9 +43,10 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
     ts TEXT NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL,
     question_id INTEGER, topic TEXT, skill TEXT, cefr TEXT, is_correct INTEGER,
-    response_time_ms INTEGER, context TEXT, extra TEXT);
+    response_time_ms INTEGER, context TEXT, extra TEXT, answer_given TEXT);
 CREATE INDEX IF NOT EXISTS ix_events_user ON events(user_id, ts);
 CREATE INDEX IF NOT EXISTS ix_events_day ON events(day);
+CREATE INDEX IF NOT EXISTS ix_events_uq ON events(user_id, event_type, question_id);
 CREATE TABLE IF NOT EXISTS rewards (
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
     kind TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT,
@@ -80,6 +82,8 @@ def connect(path):
     for name in ("sub_chat", "sub_msg"):
         if name not in cols:
             con.execute(f"ALTER TABLE homework_status ADD COLUMN {name} INTEGER")
+    if "answer_given" not in {r[1] for r in con.execute("PRAGMA table_info(events)")}:
+        con.execute("ALTER TABLE events ADD COLUMN answer_given TEXT")
     if "remind" not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
         con.execute("ALTER TABLE users ADD COLUMN remind INTEGER NOT NULL DEFAULT 1")
     con.commit()
@@ -146,7 +150,8 @@ def get_character(con, user_id):
 
 # ---------- журнал событий ----------
 def log_event(con, user_id, event_type, day, **kw):
-    allowed = ("question_id", "topic", "skill", "cefr", "is_correct", "response_time_ms", "context", "extra")
+    allowed = ("question_id", "topic", "skill", "cefr", "is_correct", "response_time_ms", "context", "extra",
+               "answer_given")
     data = {k: v for k, v in kw.items() if k in allowed}
     cols = ["user_id", "ts", "day", "event_type"] + list(data)
     vals = [user_id, utc_now(), day.isoformat(), event_type] + list(data.values())
@@ -160,16 +165,20 @@ def get_question(con, qid):
 
 
 def pick_questions(con, user_id, level, n=5):
-    """Вопросы уровня ученика и следующего уровня; сначала те, что он давно не видел."""
+    """Вопросы уровня ученика и следующего; сначала те, что он давно не видел (или не видел вовсе)."""
     idx = (level - 1) // 20
     levels = {CEFR[idx]}
     if idx + 1 < len(CEFR):
         levels.add(CEFR[idx + 1])
+    seen = {r[0]: r[1] for r in con.execute(
+        "SELECT question_id, MAX(ts) FROM events WHERE user_id=? AND event_type='answer' AND question_id IS NOT NULL "
+        "GROUP BY question_id", (user_id,))}
 
     def fetch(where, params):
-        sql = ("SELECT q.*, (SELECT MAX(e.ts) FROM events e WHERE e.user_id=? AND e.question_id=q.id "
-               "AND e.event_type='answer') AS last_seen FROM questions q WHERE q.active=1 " + where)
-        return [dict(r) for r in con.execute(sql, [user_id] + params)]
+        rows = [dict(r) for r in con.execute("SELECT * FROM questions q WHERE q.active=1 " + where, params)]
+        for r in rows:
+            r["last_seen"] = seen.get(r["id"])
+        return rows
 
     rows = fetch(f"AND q.cefr IN ({','.join('?' * len(levels))})", sorted(levels))
     if len(rows) < n:
@@ -489,12 +498,59 @@ def list_topics(con):
     return [r[0] for r in con.execute("SELECT DISTINCT topic FROM questions WHERE active=1 ORDER BY topic")]
 
 
-def pick_homework_questions(con, topic, count):
-    """Случайные вопросы по теме (или по всему банку), от лёгких к сложным."""
+def topic_key(topic):
+    """Короткий стабильный ключ темы для кнопок (названия тем слишком длинные для callback_data)."""
+    return hashlib.md5(topic.encode("utf-8")).hexdigest()[:8]
+
+
+def topic_by_key(con, key):
+    for (t,) in con.execute("SELECT DISTINCT topic FROM questions WHERE active=1"):
+        if topic_key(t) == key:
+            return t
+    return None
+
+
+def topic_stats(con, cefr=None, query=None):
+    """[(тема, число активных вопросов)] с фильтром по уровню и по части названия (без учёта регистра)."""
+    sql, params = "SELECT topic, COUNT(*) AS n FROM questions WHERE active=1", []
+    if cefr:
+        sql += " AND cefr=?"
+        params.append(cefr)
+    rows = [(r["topic"], r["n"]) for r in con.execute(sql + " GROUP BY topic", params)]
+    if query:
+        key = query.casefold()
+        rows = [r for r in rows if key in r[0].casefold()]
+    return sorted(rows, key=lambda r: r[0].casefold())
+
+
+def count_questions(con, topic=None, cefr=None):
+    sql, params = "SELECT COUNT(*) FROM questions WHERE active=1", []
+    if topic:
+        sql += " AND topic=?"
+        params.append(topic)
+    if cefr:
+        sql += " AND cefr=?"
+        params.append(cefr)
+    return con.execute(sql, params).fetchone()[0]
+
+
+def similar_topics(con):
+    """Названия тем, которые отличаются только регистром или пробелами: скорее всего, опечатка в таблице."""
+    groups = {}
+    for (t,) in con.execute("SELECT DISTINCT topic FROM questions"):
+        groups.setdefault(" ".join(t.casefold().split()), []).append(t)
+    return [sorted(v) for v in groups.values() if len(v) > 1]
+
+
+def pick_homework_questions(con, topic, count, cefr=None):
+    """Случайные вопросы по теме (и уровню), от лёгких к сложным."""
     sql, params = "SELECT id, cefr FROM questions WHERE active=1", []
     if topic:
         sql += " AND topic=?"
         params.append(topic)
+    if cefr:
+        sql += " AND cefr=?"
+        params.append(cefr)
     rows = [dict(r) for r in con.execute(sql, params)]
     random.shuffle(rows)
     rows = rows[:count]

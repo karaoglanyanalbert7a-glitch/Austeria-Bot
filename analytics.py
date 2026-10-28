@@ -1,6 +1,6 @@
 """Аналитика для учителя: флаги риска, динамика по неделям, недельный дайджест, экспорт в Excel.
 Модуль работает только с базой данных (без Telegram), поэтому его удобно проверять на тестовых данных."""
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import date, timedelta
 from html import escape as esc
 
@@ -179,6 +179,160 @@ def flags_text(flags):
 
 
 # =====================================================================================
+#  Светофор учеников
+# =====================================================================================
+STATUS_ICON = {"green": "🟢", "yellow": "🟡", "red": "🔴", "none": "⚪"}
+LEGEND = "🟢 всё хорошо · 🟡 присмотреться · 🔴 нужна помощь · ⚪ мало данных"
+
+
+def student_status(con, today, user_id=None):
+    """Один значок на ученика: {id: {"code", "icon", "reason"}}.
+    🔴 пропал/ни разу не занимался или сразу несколько проблем, 🟡 одна проблема или низкая точность/редкие занятия,
+    ⚪ слишком мало данных (новичок), 🟢 всё в порядке."""
+    flags = risk_flags(con, today, user_id=user_id)
+    sql, params = "SELECT id, created_at FROM users WHERE role='student' AND is_active=1", []
+    if user_id is not None:
+        sql += " AND id=?"
+        params.append(user_id)
+    rows14 = defaultdict(list)
+    for r in answer_rows(con, today - timedelta(days=13), user_id=user_id):
+        rows14[r["user_id"]].append(r)
+    out = {}
+    for s in con.execute(sql, params).fetchall():
+        uid, fl = s["id"], flags.get(s["id"], [])
+        codes = {f[0] for f in fl}
+        reg_days = (today - d(s["created_at"][:10])).days
+        n14, ok14 = totals(rows14[uid])
+        days7 = len({r["day"] for r in rows14[uid] if d(r["day"]) >= today - timedelta(days=6)})
+        if codes & {"absent", "never"} or len(codes) >= 2:
+            code, reason = "red", flags_text(fl)
+        elif codes:
+            code, reason = "yellow", flags_text(fl)
+        elif n14 >= 10 and pct(ok14, n14) < 50:
+            code, reason = "yellow", f"🎯 точность ниже 50% ({pct(ok14, n14)}% за 14 дней)"
+        elif reg_days >= 7 and days7 <= 1:
+            code, reason = "yellow", "занимается редко"
+        elif n14 < 3:
+            code, reason = "none", "мало данных"
+        else:
+            code, reason = "green", "всё в порядке"
+        out[uid] = {"code": code, "icon": STATUS_ICON[code], "reason": reason}
+    return out
+
+
+def status_line(statuses):
+    c = Counter(v["code"] for v in statuses.values())
+    return f"🚦 Светофор: 🟢 {c['green']} · 🟡 {c['yellow']} · 🔴 {c['red']} · ⚪ {c['none']}"
+
+
+# =====================================================================================
+#  Карта освоения тем
+# =====================================================================================
+MASTERY_WINDOW = 10      # состояние темы считается по последним 10 ответам
+MASTERY_ICON = {"mastered": "🟢", "progress": "🟡", "problem": "🔴"}
+MASTERY_WORD = {"mastered": "освоено", "progress": "в процессе", "problem": "проблема"}
+
+
+def mastery_state(n, acc):
+    """🔴 проблема: ≥3 ответов и точность <50%. 🟢 освоено: ≥5 ответов и точность ≥80%. Иначе 🟡 в процессе."""
+    if n >= 3 and acc < 50:
+        return "problem"
+    if n >= 5 and acc >= 80:
+        return "mastered"
+    return "progress"
+
+
+def topic_mastery(con, user_id=None, group_id=None):
+    """{(id ученика, тема): {state, n, ok, acc, total}} по последним ответам темы."""
+    sql = ("SELECT e.user_id, e.topic, e.is_correct FROM events e JOIN users u ON u.id=e.user_id "
+           "WHERE e.event_type='answer' AND e.topic IS NOT NULL AND u.role='student' AND u.is_active=1")
+    params = []
+    if user_id is not None:
+        sql += " AND e.user_id=?"
+        params.append(user_id)
+    if group_id is not None:
+        sql += " AND u.group_id=?"
+        params.append(group_id)
+    win, total = defaultdict(lambda: deque(maxlen=MASTERY_WINDOW)), defaultdict(int)
+    for r in con.execute(sql + " ORDER BY e.id", params):
+        win[(r["user_id"], r["topic"])].append(r["is_correct"] or 0)
+        total[(r["user_id"], r["topic"])] += 1
+    out = {}
+    for k, w in win.items():
+        n, ok = len(w), sum(w)
+        out[k] = {"state": mastery_state(n, pct(ok, n)), "n": n, "ok": ok, "acc": pct(ok, n), "total": total[k]}
+    return out
+
+
+def student_map(con, user_id):
+    """Темы ученика: сначала проблемные, потом «в процессе», потом освоенные."""
+    order = {"problem": 0, "progress": 1, "mastered": 2}
+    items = [dict(topic=k[1], **v) for k, v in topic_mastery(con, user_id=user_id).items()]
+    items.sort(key=lambda x: (order[x["state"]], x["acc"], x["topic"].casefold()))
+    return items
+
+
+def group_map(con, group_id=None):
+    """Темы группы (или всех учеников): у скольких учеников проблема / в процессе / освоено."""
+    names = {r["id"]: r["nickname"] for r in con.execute("SELECT id, nickname FROM users")}
+    by_topic = defaultdict(lambda: {"problem": [], "progress": [], "mastered": []})
+    for (uid, topic), v in topic_mastery(con, group_id=group_id).items():
+        by_topic[topic][v["state"]].append(names[uid])
+    rows = [{"topic": t, "problem": len(v["problem"]), "progress": len(v["progress"]), "mastered": len(v["mastered"]),
+             "total": sum(len(x) for x in v.values()), "problem_names": sorted(v["problem"])}
+            for t, v in by_topic.items()]
+    rows.sort(key=lambda r: (-r["problem"], -r["progress"], r["topic"].casefold()))
+    return rows
+
+
+# =====================================================================================
+#  Типичные ошибки
+# =====================================================================================
+def common_mistakes(con, since_day, group_id=None, user_id=None, limit=8, min_wrong=3):
+    """Вопросы, на которых чаще всего ошибаются, и какой неверный ответ выбирают чаще всего."""
+    sql = ("SELECT e.question_id, e.is_correct, e.answer_given, q.topic, q.cefr, q.question, q.type, q.correct, "
+           "q.option_a, q.option_b, q.option_c, q.option_d FROM events e JOIN questions q ON q.id=e.question_id "
+           "JOIN users u ON u.id=e.user_id WHERE e.event_type='answer' AND e.day>=? AND u.role='student' "
+           "AND u.is_active=1")
+    params = [since_day.isoformat()]
+    if group_id is not None:
+        sql += " AND u.group_id=?"
+        params.append(group_id)
+    if user_id is not None:
+        sql += " AND e.user_id=?"
+        params.append(user_id)
+    per = {}
+    for r in con.execute(sql, params):
+        p = per.setdefault(r["question_id"], {"row": r, "n": 0, "wrong": 0, "given": Counter()})
+        p["n"] += 1
+        if not r["is_correct"]:
+            p["wrong"] += 1
+            if r["answer_given"]:
+                p["given"][r["answer_given"].strip().lower()] += 1
+    items = []
+    for p in per.values():
+        if p["wrong"] < min_wrong:
+            continue
+        r, top = p["row"], p["given"].most_common(1)
+        items.append({"topic": r["topic"], "cefr": r["cefr"], "question": r["question"], "correct": db.correct_display(r),
+                      "n": p["n"], "wrong": p["wrong"], "top": top[0][0] if top else None,
+                      "top_count": top[0][1] if top else 0, "recorded": sum(p["given"].values())})
+    items.sort(key=lambda x: (-x["wrong"], -x["wrong"] / x["n"]))
+    return items[:limit]
+
+
+def mistakes_text(items, start=1):
+    lines = []
+    for i, x in enumerate(items, start):
+        lines.append(f"{i}. {esc(x['topic'])} · {x['cefr']} — «{esc(x['question'][:90])}»")
+        tail = f"   Верно: {esc(x['correct'])}. Ошибок: {x['wrong']} из {x['n']}"
+        if x["top"]:
+            tail += f". Чаще всего выбирали: «{esc(x['top'])}» ({x['top_count']} из {x['recorded']})"
+        lines.append(tail)
+    return "\n".join(lines)
+
+
+# =====================================================================================
 #  Недельный дайджест
 # =====================================================================================
 def _arrow(now, before, unit="", points=False):
@@ -214,6 +368,7 @@ def build_digest(con, today):
                   f"👥 Занимались: {len(act1)} из {len(students)}{_arrow(len(act1), len(act0) or None)}",
                   f"✍️ Ответов: {n1}{_arrow(n1, n0 or None)}",
                   f"🎯 Точность: {pct_text(ok1, n1)}{_arrow(pct(ok1, n1), pct(ok0, n0), points=True)}"]
+    lines += ["", status_line(student_status(con, today))]
     # по группам
     by_group = defaultdict(list)
     for s in students:
@@ -225,16 +380,23 @@ def build_digest(con, today):
             n, ok = totals(rows)
             lines.append(f"• {esc(name)} — занимались {len({r['user_id'] for r in rows})}/{len(ids)} · "
                          f"{pct_text(ok, n)} · {n} отв.")
-    # слабые темы
-    topics = defaultdict(lambda: [0, 0])
-    for r in cur_rows:
-        topics[r["topic"]][0] += 1
-        topics[r["topic"]][1] += r["is_correct"] or 0
-    weak = sorted(((pct(ok, n), t, n) for t, (n, ok) in topics.items() if n >= 10))[:3]
-    weak = [w for w in weak if w[0] < 75]
-    if weak:
-        lines += ["", "<b>Что стоит разобрать на уроке</b>"]
-        lines += [f"• {esc(t)}: {p}% ({n} отв.)" for p, t, n in weak]
+    # темы с проблемами (по карте освоения) и типичные ошибки
+    problem = [r for r in group_map(con) if r["problem"] >= 2 or (r["problem"] >= 1 and r["problem"] / r["total"] >= 0.4)][:3]
+    if problem:
+        lines += ["", "<b>Темы, где больше всего проблем</b>"]
+        lines += [f"• {esc(r['topic'])}: 🔴 {r['problem']} · 🟡 {r['progress']} · 🟢 {r['mastered']} (из {r['total']})"
+                  for r in problem]
+    else:
+        topics = defaultdict(lambda: [0, 0])
+        for r in cur_rows:
+            topics[r["topic"]][0] += 1
+            topics[r["topic"]][1] += r["is_correct"] or 0
+        weak = [w for w in sorted((pct(ok, n), t, n) for t, (n, ok) in topics.items() if n >= 10)[:3] if w[0] < 75]
+        if weak:
+            lines += ["", "<b>Что стоит разобрать на уроке</b>"] + [f"• {esc(t)}: {p}% ({n} отв.)" for p, t, n in weak]
+    mist = common_mistakes(con, cur_start, limit=3)
+    if mist:
+        lines += ["", "<b>🧩 Типичные ошибки недели</b>", mistakes_text(mist)]
     # внимание
     flags = risk_flags(con, today, end=end)
     if flags:
@@ -310,6 +472,7 @@ def build_export(con, today, path, weeks=8, log_days=180):
     """Собирает Excel-файл: ученики, темы по ученикам, динамика, журнал ответов, домашка."""
     since = today - timedelta(days=13)
     flags = risk_flags(con, today)
+    status = student_status(con, today)
     students = db.students_overview(con, (today - timedelta(days=6)).isoformat())
     wb = Workbook()
 
@@ -321,13 +484,13 @@ def build_export(con, today, path, weeks=8, log_days=180):
                           "AND event_type='answer'", (uid,)).fetchone()
         started, finished = db.quiz_counts(con, uid, since.isoformat())
         last = con.execute("SELECT MAX(day) FROM events WHERE user_id=? AND event_type='answer'", (uid,)).fetchone()[0]
-        rows.append([s["nickname"], s["grp"] or "", ch["level"], db.cefr_for_level(ch["level"]), ch["xp"], ch["coins"],
+        rows.append([s["nickname"], s["grp"] or "", status[uid]["icon"] + " " + status[uid]["reason"], ch["level"], db.cefr_for_level(ch["level"]), ch["xp"], ch["coins"],
                      db.effective_streak(ch, today), last or "", tot[0], pct(tot[1], tot[0]), s["n"],
                      pct(s["ok"], s["n"]), started, finished, flags_text(flags.get(uid, []))])
-    ws = _sheet(wb, "Ученики", ["Ник", "Группа", "Уровень", "CEFR", "XP", "Монеты", "Серия, дн.", "Последний ответ",
+    ws = _sheet(wb, "Ученики", ["Ник", "Группа", "Светофор", "Уровень", "CEFR", "XP", "Монеты", "Серия, дн.", "Последний ответ",
                                 "Ответов всего", "Точность всего, %", "Ответов за 7 дн.", "Точность за 7 дн., %",
                                 "Квизов начато (14 дн.)", "Квизов закончено (14 дн.)", "Сигналы"], rows,
-                {1: 18, 2: 18, 15: 48}, first=True)
+                {1: 18, 2: 18, 3: 40, 16: 48}, first=True)
 
     # темы × ученики
     topics = [r[0] for r in con.execute("SELECT DISTINCT topic FROM events WHERE event_type='answer' AND topic IS NOT NULL "
@@ -343,6 +506,18 @@ def build_export(con, today, path, weeks=8, log_days=180):
         for c in row:
             if isinstance(c.value, int) and (c.value >= 80 or c.value < 50):
                 c.fill = GREEN if c.value >= 80 else RED
+
+    # освоение тем
+    mast = topic_mastery(con)
+    m_topics = sorted({k[1] for k in mast}, key=str.casefold)
+    m_rows = [[s["nickname"], s["grp"] or ""] + [MASTERY_WORD[mast[(s["id"], t)]["state"]] if (s["id"], t) in mast else None
+                                                 for t in m_topics] for s in students]
+    ws = _sheet(wb, "Освоение тем", ["Ник", "Группа"] + m_topics, m_rows, {1: 18, 2: 18})
+    fills = {"освоено": GREEN, "проблема": RED, "в процессе": PatternFill("solid", start_color="FFEB9C")}
+    for row in ws.iter_rows(min_row=2, min_col=3):
+        for c in row:
+            if c.value in fills:
+                c.fill = fills[c.value]
 
     # динамика
     first_week = monday(today) - timedelta(weeks=weeks - 1)
@@ -369,6 +544,13 @@ def build_export(con, today, path, weeks=8, log_days=180):
            ORDER BY e.day, e.id LIMIT 50000""", ((today - timedelta(days=log_days)).isoformat(),)).fetchall()
     _sheet(wb, "Журнал ответов", ["Дата", "Ник", "Группа", "Тема", "Навык", "CEFR", "id вопроса", "Верно (1/0)",
                                   "Время, мс", "Откуда"], [tuple(r) for r in log], {1: 12, 2: 18, 3: 18, 4: 28})
+
+    # типичные ошибки
+    mist = common_mistakes(con, today - timedelta(days=60), limit=100, min_wrong=2)
+    _sheet(wb, "Типичные ошибки", ["Тема", "Уровень", "Вопрос", "Верный ответ", "Ответов", "Ошибок", "Частая ошибка",
+                                   "Сколько раз"],
+           [[x["topic"], x["cefr"], x["question"], x["correct"], x["n"], x["wrong"], x["top"] or "", x["top_count"] or ""]
+            for x in mist], {1: 24, 3: 50, 4: 22, 7: 22})
 
     # домашка
     hw_rows = []
