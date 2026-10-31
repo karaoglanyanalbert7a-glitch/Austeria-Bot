@@ -36,7 +36,7 @@ TEACHERS = {int(x) for x in os.getenv("TEACHER_IDS", "").replace(" ", "").split(
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Amsterdam"))
 DATA_DIR = os.getenv("DATA_DIR", "").strip()   # на хостинге это /app/data: единственная папка, которая переживает обновления
 DB_PATH = os.getenv("DB_PATH", "").strip() or (os.path.join(DATA_DIR, "bot.db") if DATA_DIR else "bot.db")
-QUIZ_SIZE = int(os.getenv("QUIZ_SIZE", "5"))
+QUIZ_SIZE = int(os.getenv("QUIZ_SIZE", "8"))
 DAY_START_HOUR = int(os.getenv("DAY_START_HOUR", "5"))   # с этого часа начинается новый «день» бота
 SCHED = sch.Config(tz=TZ, day_start_hour=DAY_START_HOUR, remind_hour=int(os.getenv("REMIND_HOUR", "18")),
                    digest_weekday=int(os.getenv("DIGEST_WEEKDAY", "0")), digest_hour=int(os.getenv("DIGEST_HOUR", "9")),
@@ -329,13 +329,21 @@ async def profile(m: Message):
     grp = db.group_name(con, u["group_id"])
     lines = [f"👤 <b>{esc(u['nickname'])}</b>" + (f" · группа {esc(grp)}" if grp else ""),
              f"⭐ Уровень <b>{lvl}</b> · {db.cefr_for_level(lvl)}"]
-    if lvl < db.MAX_LEVEL:
+    ps = db.program_summary(con, u["id"])
+    capped = db.level_cap_on(con) and db.level_from_xp(ch["xp"]) > lvl
+    if capped:
+        lines.append(f"XP: {ch['xp']} (это максимум для уровня {ps['band']})")
+    elif lvl < db.MAX_LEVEL:
         lo, hi = db.xp_for_level(lvl), db.xp_for_level(lvl + 1)
         lines.append(f"XP: {ch['xp']}  {bar(ch['xp'] - lo, hi - lo)}  до уровня {lvl + 1}: {hi - ch['xp']}")
     else:
         lines.append(f"XP: {ch['xp']} (максимальный уровень!)")
     daily = {"done": "✅ пройден", "started": "⏳ начат, можно закончить («🎯 Квиз»)",
              "none": "🎯 ждёт тебя"}[db.daily_status(con, u["id"], today())]
+    if ps["covered_total"]:
+        lines.append(f"📚 Программа {ps['band']}: пройдено {ps['done']} из {ps['program']} тем")
+    if capped and ps["next_band"]:
+        lines.append(f"🔒 Чтобы перейти на {ps['next_band']}, нужно пройти программу {ps['band']}")
     lines += [f"📅 Квиз дня: {daily}", f"🪙 Монеты: {ch['coins']}",
               f"🔥 Серия: {db.effective_streak(ch, today())} дн. · ❄️ заморозок: {ch['freezes']}",
               f"\n📚 Словарь: {ch['vocabulary']} · 🧩 Грамматика: {ch['grammar']}\n"
@@ -423,12 +431,19 @@ def fresh(d):
     return bool(d.get("qids")) and d.get("day") == today().isoformat()
 
 
+def slot_of(d, pos):
+    slots = d.get("slots") or []
+    return slots[pos] if pos < len(slots) else None
+
+
 def q_header(d, q, pos):
     prefix = ""
     if d.get("hw_id"):
         hw = db.get_homework(con, d["hw_id"])
         prefix = f"📝 {esc(hw['title'])} · " if hw else ""
     tag = {"practice": " · 🏋️ тренировка", "homework_late": " · ⏰ после дедлайна"}.get(d["context"], "")
+    if slot_of(d, pos) == "new":
+        tag += " · 🆕 новая тема"
     return (f"<b>{prefix}Вопрос {pos + 1}/{len(d['qids'])}</b> · {esc(q['topic'])} · {q['cefr']}{tag}\n\n"
             f"{esc(q['question'])}")
 
@@ -491,14 +506,14 @@ async def launch_quiz(bot: Bot, chat_id, tg_id, state: FSMContext):
         return
     await drop_card(bot, chat_id, d)  # вчерашняя карточка больше не нужна
     ch = db.get_character(con, u["id"])
-    qs = db.pick_questions(con, u["id"], ch["level"], QUIZ_SIZE)
+    qs = db.compose_quiz(con, u["id"], QUIZ_SIZE, today())
     if not qs:
         await bot.send_message(chat_id, "Пока нет вопросов. Попроси учителя загрузить их 🙂")
         return
     ctx = "practice" if db.daily_started_today(con, u["id"], today()) else "daily"
     await state.set_state(None)
-    await state.set_data({"qids": [q["id"] for q in qs], "pos": 0, "correct": 0, "xp": 0, "coins": 0,
-                          "context": ctx, "lvl0": ch["level"], "shown_at": time.time(),
+    await state.set_data({"qids": [q["id"] for q in qs], "slots": [q["slot"] for q in qs], "pos": 0, "correct": 0,
+                          "xp": 0, "coins": 0, "context": ctx, "lvl0": ch["level"], "shown_at": time.time(),
                           "day": today().isoformat(), "card_id": None, "phase": "q"})
     db.log_event(con, u["id"], "quiz_start", today(), context=ctx)
     note = ("<i>Ежедневный квиз ты уже проходил(а): это дополнительная тренировка "
@@ -611,8 +626,11 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
     ctx = d["context"]
     gain, coins = db.apply_answer(con, u["id"], ok, ctx, q["skill"])
     chosen = q["option_" + given] if q["type"] == "choice" else given.strip()[:80]   # что именно ответил ученик
+    slot = slot_of(d, pos)
     db.log_event(con, u["id"], "answer", today(), question_id=q["id"], topic=q["topic"], skill=q["skill"],
-                 cefr=q["cefr"], is_correct=int(ok), response_time_ms=ms, context=ctx, answer_given=chosen)
+                 cefr=q["cefr"], is_correct=int(ok), response_time_ms=ms, context=ctx, answer_given=chosen, slot=slot)
+    if slot != "new":
+        db.check_relearn(con, u["id"], q["topic"])     # стабильные ошибки возвращают тему «на повтор»
     if d.get("hw_id"):
         db.hw_record_answer(con, d["hw_id"], u["id"], q["id"], ok)
     d2 = {**d, "correct": d["correct"] + int(ok), "xp": d["xp"] + gain, "coins": d["coins"] + coins}
@@ -1009,18 +1027,21 @@ def auto_content():
             "Если ученик 3 раза не ответил на напоминание, бот перестаёт напоминать, пока он не вернётся.\n"
             f"• <b>Недельный дайджест вам:</b> {state('digest')}. По {WEEKDAYS[SCHED.digest_weekday]} в "
             f"{SCHED.digest_hour}:00.\n"
-            f"• <b>Сигналы о проблемах:</b> {state('flags')}. Ежедневно в {SCHED.digest_hour}:00, только новые.\n\n"
+            f"• <b>Сигналы о проблемах:</b> {state('flags')}. Ежедневно в {SCHED.digest_hour}:00, только новые.\n"
+            f"• <b>Потолок уровня:</b> {state('level_cap')}. Опыт копится, но уровень ученика не выходит за верх его "
+            "полосы CEFR (например, A2 максимум 40), пока вы не переведёте его на следующий уровень.\n\n"
             f"Ученики, отключившие напоминания: {off}. Время меняется переменными REMIND_HOUR, DIGEST_WEEKDAY, "
             "DIGEST_HOUR (см. DEPLOY.md).")
     rows = [[(("🔕 Выключить" if db.get_setting(con, k, "1") == "1" else "🔔 Включить") + f" {name}", f"au:t:{k}")]
-            for k, name in (("reminders", "напоминания"), ("digest", "дайджест"), ("flags", "сигналы"))]
+            for k, name in (("reminders", "напоминания"), ("digest", "дайджест"), ("flags", "сигналы"),
+                            ("level_cap", "потолок уровня"))]
     return text, ikb(*rows, [("⬅️ Назад", "tp:home")])
 
 
 @teacher.callback_query(F.data.startswith("au:t:"))
 async def auto_toggle(cb: CallbackQuery):
     key = cb.data.split(":")[2]
-    if key in ("reminders", "digest", "flags"):
+    if key in ("reminders", "digest", "flags", "level_cap"):
         db.set_setting(con, key, "0" if db.get_setting(con, key, "1") == "1" else "1")
     await cb.answer("Сохранено")
     text, kb = auto_content()
@@ -1173,10 +1194,16 @@ def student_card_content(uid, back):
         f"Последний ответ: {r['last_answer'] or 'никогда'} · за 7 дней: ответов {r['n']}, верно {acc}"])
     stt = an.student_status(con, today(), user_id=uid)[uid]
     text += f"\n🚦 {stt['icon']} {esc(stt['reason'])}"
+    ps = db.program_summary(con, uid)
+    text += (f"\n📚 Программа {ps['band']}: пройдено {ps['done']} из {ps['program']} тем"
+             + (f" · 🔁 на повтор: {len(ps['relearn'])}" if ps["relearn"] else "")
+             if ps["covered_total"] else "\n📚 Программа не заполнена: квизы идут только по уровню")
+    if ps["ready"] and ps["next_band"]:
+        text += f"\n🎓 Прошёл(ла) почти всю программу: можно перевести на {ps['next_band']}"
     return text, ikb([("📈 Отчёт", f"st:r:{uid}:{back}"), ("🗺 Карта тем", f"mp:s:{uid}:{back}:0")],
-                     [("🧩 Ошибки ученика", f"ms:u{uid}:0"), ("🏷 Группа", f"st:g:{uid}:{back}")],
-                     [("🎁 Наградить", f"rw:a:u{uid}:p"), ("⚠️ Штраф", f"rw:a:u{uid}:m")],
-                     [("⬅️ К списку", f"st:l:c:{flt}:{page}")])
+                     [("📚 Программа", f"pg:s:{uid}:{back}"), ("🧩 Ошибки ученика", f"ms:u{uid}:0")],
+                     [("🏷 Группа", f"st:g:{uid}:{back}"), ("🎁 Наградить", f"rw:a:u{uid}:p")],
+                     [("⚠️ Штраф", f"rw:a:u{uid}:m"), ("⬅️ К списку", f"st:l:c:{flt}:{page}")])
 
 
 @teacher.callback_query(F.data.startswith("st:"))
@@ -1312,6 +1339,232 @@ async def t_mistakes(m: Message):
     await m.answer(text, reply_markup=kb)
 
 
+# ---------- программа: пройденные темы и перевод на уровень ----------
+def level_chips(topics, current, prefix_cb):
+    """Кнопки-фильтры по уровню начала темы (только те уровни, которые есть в программе)."""
+    present = [c for c in db.CEFR if any(t["level_from"] == c for t in topics)]
+    return [[(("✔️ " if current == k else "") + label, prefix_cb(k)) for k, label in [("a", "Все")] + [(c, c) for c in present]]]
+
+
+def program_content(uid, back):
+    u, ps, ch = user_by_id(uid), db.program_summary(con, uid), db.get_character(con, uid)
+    flt = back
+    lines = [f"📚 <b>Программа · {esc(u['nickname'])}</b>",
+             f"Уровень: <b>{ps['band']}</b> (ур. {ch['level']}, XP {ch['xp']})",
+             f"Грамматика: пройдено {ps['covered_total']} из {ps['grammar_total']} тем; программа {ps['band']}: "
+             f"{ps['done']} из {ps['program']}"]
+    if not ps["covered_total"]:
+        lines.append("\nПрограмма пока не заполнена: квизы собираются только по уровню. Отметьте пройденные темы "
+                     "или переведите ученика на уровень: тогда грамматика пойдёт по темам.")
+    if ps["relearn"]:
+        lines += ["", "<b>🔁 На повтор</b> (стабильные ошибки после отметки)"]
+        lines += [f"• {esc(t['topic'])}: {esc(t['reason'] or '')}" for t in ps["relearn"][:6]]
+    hints = an.preview_hints(con, uid)
+    if hints:
+        lines += ["", "<b>💡 Возможно, уже знает</b> (уверенно отвечает на вопросы непройденной темы)"]
+        lines += [f"• {esc(h['topic'])}: {h['ok']} из {h['n']}" for h in hints[:5]]
+    rows = [[("✅ Отметить темы", f"pt:{uid}:a:{back}:0")], [("🎯 Перевести на уровень", f"lv:s:{uid}:{back}")]]
+    if ps["ready"] and ps["next_band"]:
+        lines += ["", f"🎓 Пройдено {ps['done']} из {ps['program']} тем: можно переводить на {ps['next_band']}."]
+        rows.append([(f"🎓 Перевести на {ps['next_band']}", f"lv:p:{uid}:{ps['next_band']}:{back}")])
+    rows.append([("⬅️ К карточке", f"st:c:{uid}:{back}")])
+    return "\n".join(lines), ikb(*rows)
+
+
+def topic_mark_content(uid, chip, back, page):
+    u, cov = user_by_id(uid), db.covered_topics(con, uid)
+    topics = db.grammar_topics(con)
+    shown = [t for t in topics if chip == "a" or t["level_from"] == chip]
+    pages = max(1, -(-len(shown) // PAGE))
+    page = max(0, min(page, pages - 1))
+    icon = lambda t: {"covered": "✅", "relearn": "🔁"}.get(cov.get(t["topic"], {}).get("status"), "☐")
+    rows = level_chips(topics, chip, lambda k: f"pt:{uid}:{k}:{back}:0")
+    for t in shown[page * PAGE:(page + 1) * PAGE]:
+        lv = t["level_from"] + (f"-{t['level_to']}" if t["level_to"] != t["level_from"] else "")
+        rows.append([(f"{icon(t)} {t['topic'][:32]} · {lv}", f"pt:t:{uid}:{db.topic_key(t['topic'])}:{chip}:{back}:{page}")])
+    rows += nav_row(page, pages, f"pt:{uid}:{chip}:{back}")
+    rows.append([("✅ Отметить все", f"pt:b:{uid}:{chip}:{back}:on"), ("☐ Снять все", f"pt:b:{uid}:{chip}:{back}:off")])
+    rows.append([("⬅️ К программе", f"pg:s:{uid}:{back}")])
+    n_done = sum(1 for t in shown if icon(t) == "✅")
+    text = (f"📚 <b>Отметка тем · {esc(u['nickname'])}</b>\n✅ пройдено · ☐ не пройдено · 🔁 на повтор\n"
+            f"Нажатие на тему меняет отметку. Показано тем: {len(shown)} (пройдено {n_done}). «Все» и «Снять все» "
+            "действуют на выбранный уровень.\nУровень темы: где она начинается в программе (A1-A2 = начинается на A1, "
+            "повторяется на A2).")
+    return text, ikb(*rows)
+
+
+def jump_chooser_content(uid, back):
+    ps = db.program_summary(con, uid)
+    rows = [[(("✔️ " if c == ps["band"] else "") + c, f"lv:p:{uid}:{c}:{back}") for c in db.CEFR],
+            [("⬅️ Назад", f"pg:s:{uid}:{back}")]]
+    return (f"🎯 <b>Перевод на уровень · {esc(user_by_id(uid)['nickname'])}</b>\nСейчас: {ps['band']}. "
+            "Выберите уровень: опыт и уровень подстроятся, а темы грамматики ниже этого уровня отметятся как пройденные "
+            "(при понижении темы выше уровня снимутся). Перед применением бот покажет, что изменится."), ikb(*rows)
+
+
+def jump_preview_content(uid, cefr, back):
+    plan = db.jump_plan(con, uid, cefr)
+    lines = [f"🎯 <b>Перевод: {esc(user_by_id(uid)['nickname'])} → {cefr}</b>",
+             f"Было: {plan['band_old']}, ур. {plan['level_old']}, XP {plan['xp_old']}",
+             f"Станет: {cefr}, ур. {plan['level']}, XP {plan['xp']}",
+             f"Грамматика: будет отмечено тем: {len(plan['to_cover'])}"
+             + (f"; снято тем: {len(plan['to_uncover'])} (понижение уровня)" if plan["to_uncover"] else "")]
+    if plan["thin"]:
+        lines.append(f"\n⚠️ В банке вопросов уровня {cefr} всего {plan['questions']}: ученик в основном будет получать "
+                     "вопросы более низкого уровня. Лучше сначала добавить вопросы этого уровня.")
+    return "\n".join(lines), ikb([("✅ Применить", f"lv:ok:{uid}:{cefr}:{back}")], [("⬅️ Назад", f"lv:s:{uid}:{back}")])
+
+
+@teacher.callback_query(F.data.startswith("pg:"))
+async def program_nav(cb: CallbackQuery):
+    p = cb.data.split(":")      # pg:s:<uid>:<back>
+    await cb.answer()
+    text, kb = program_content(int(p[2]), p[3])
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data.startswith("pt:"))
+async def topics_mark_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    toast = None
+    if p[1] == "t":         # pt:t:<uid>:<key>:<chip>:<back>:<page>
+        uid, topic = int(p[2]), db.topic_by_key(con, p[3])
+        chip, back, page = p[4], p[5], int(p[6])
+        if topic:
+            st = db.covered_topics(con, uid).get(topic, {}).get("status")
+            if st == "covered":
+                db.clear_topic(con, uid, topic)
+            else:
+                db.set_topic_status(con, uid, topic, "covered", "teacher")
+    elif p[1] == "b":       # pt:b:<uid>:<chip>:<back>:<on|off>
+        uid, chip, back, page = int(p[2]), p[3], p[4], 0
+        n = 0
+        for t in db.grammar_topics(con):
+            if chip == "a" or t["level_from"] == chip:
+                if p[5] == "on":
+                    db.set_topic_status(con, uid, t["topic"], "covered", "teacher")
+                else:
+                    db.clear_topic(con, uid, t["topic"])
+                n += 1
+        toast = f"{'Отмечено' if p[5] == 'on' else 'Снято'} тем: {n}"
+    else:                   # pt:<uid>:<chip>:<back>:<page>
+        uid, chip, back, page = int(p[1]), p[2], p[3], int(p[4])
+    await cb.answer(toast)
+    text, kb = topic_mark_content(uid, chip, back, page)
+    await edit(cb, text, kb)
+
+
+async def notify_level(bot: Bot, u, plan):
+    await notify_student(bot, u, f"🎓 Учитель перевёл тебя на уровень <b>{plan['cefr']}</b> (ур. {plan['level']}). "
+                                 "Квизы теперь подстроятся под него. Удачи!")
+
+
+@teacher.callback_query(F.data.startswith("lv:"))
+async def level_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    act, uid = p[1], int(p[2])
+    await cb.answer()
+    if act == "s":
+        text, kb = jump_chooser_content(uid, p[3])
+    elif act == "p":
+        text, kb = jump_preview_content(uid, p[3], p[4])
+    else:                   # lv:ok:<uid>:<cefr>:<back>
+        plan = db.apply_jump(con, uid, p[3], today(), by_user_id=(player(cb.from_user.id) or {"id": None})["id"])
+        await notify_level(cb.bot, user_by_id(uid), plan)
+        text, kb = program_content(uid, p[4])
+        text = f"✅ Переведён(а) на {p[3]}: ур. {plan['level']}, отмечено тем: {len(plan['to_cover'])}.\n\n" + text
+    await edit(cb, text, kb)
+
+
+def group_program_content(gid, chip, page):
+    g, members = group_by_id(gid), db.group_students(con, gid)
+    topics = db.grammar_topics(con)
+    shown = [t for t in topics if chip == "a" or t["level_from"] == chip]
+    covered_by = Counter()
+    for u in members:
+        for topic, r in db.covered_topics(con, u["id"]).items():
+            if r["status"] == "covered":
+                covered_by[topic] += 1
+    n = len(members)
+    pages = max(1, -(-len(shown) // PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = level_chips(topics, chip, lambda k: f"gp:{gid}:{k}:0")
+    for t in shown[page * PAGE:(page + 1) * PAGE]:
+        c = covered_by[t["topic"]]
+        mark = "✅" if n and c == n else ("◐" if c else "☐")
+        rows.append([(f"{mark} {t['topic'][:32]} · {c}/{n}", f"gp:t:{gid}:{db.topic_key(t['topic'])}:{chip}:{page}")])
+    rows += nav_row(page, pages, f"gp:{gid}:{chip}")
+    rows.append([("✅ Отметить все", f"gp:b:{gid}:{chip}:on"), ("☐ Снять все", f"gp:b:{gid}:{chip}:off")])
+    rows.append([("⬅️ К группе", f"gr:c:{gid}")])
+    text = (f"📚 <b>Программа группы · {esc(g['name'])}</b> ({n} уч.)\n✅ у всех · ◐ у части · ☐ ни у кого\n"
+            "Нажатие на тему: если она пройдена не у всех, отметится у всех учеников группы; если у всех, отметка снимется. "
+            "Так удобно отмечать тему сразу после урока.")
+    return text, ikb(*rows)
+
+
+@teacher.callback_query(F.data.startswith("gp:"))
+async def group_program_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    toast = None
+    if p[1] == "t":         # gp:t:<gid>:<key>:<chip>:<page>
+        gid, chip, page = int(p[2]), p[4], int(p[5])
+        topic, members = db.topic_by_key(con, p[3]), db.group_students(con, int(p[2]))
+        if topic and members:
+            have = [u for u in members if db.covered_topics(con, u["id"]).get(topic, {}).get("status") == "covered"]
+            if len(have) == len(members):
+                for u in members:
+                    db.clear_topic(con, u["id"], topic)
+                toast = "Отметка снята у всех"
+            else:
+                for u in members:
+                    db.set_topic_status(con, u["id"], topic, "covered", "group")
+                toast = f"Отмечено у всех ({len(members)})"
+    elif p[1] == "b":       # gp:b:<gid>:<chip>:<on|off>
+        gid, chip, page = int(p[2]), p[3], 0
+        members = db.group_students(con, gid)
+        topics = [t for t in db.grammar_topics(con) if chip == "a" or t["level_from"] == chip]
+        for u in members:
+            for t in topics:
+                if p[4] == "on":
+                    db.set_topic_status(con, u["id"], t["topic"], "covered", "group")
+                else:
+                    db.clear_topic(con, u["id"], t["topic"])
+        toast = f"{'Отмечено' if p[4] == 'on' else 'Снято'}: {len(topics)} тем у {len(members)} уч."
+    else:                   # gp:<gid>:<chip>:<page>
+        gid, chip, page = int(p[1]), p[2], int(p[3])
+    await cb.answer(toast)
+    text, kb = group_program_content(gid, chip, page)
+    await edit(cb, text, kb)
+
+
+@teacher.callback_query(F.data.startswith("gl:"))
+async def group_level_nav(cb: CallbackQuery):
+    p = cb.data.split(":")      # gl:s:<gid> | gl:p:<gid>:<cefr> | gl:ok:<gid>:<cefr>
+    act, gid = p[1], int(p[2])
+    g, members = group_by_id(gid), db.group_students(con, gid)
+    await cb.answer()
+    if act == "s":
+        text = (f"🎯 <b>Уровень всей группе · {esc(g['name'])}</b> ({len(members)} уч.)\nВыберите уровень: у каждого ученика "
+                "уровень и опыт подстроятся, темы грамматики ниже этого уровня отметятся как пройденные.")
+        kb = ikb([(c, f"gl:p:{gid}:{c}") for c in db.CEFR], [("⬅️ К группе", f"gr:c:{gid}")])
+    elif act == "p":
+        plans = [db.jump_plan(con, u["id"], p[3]) for u in members]
+        cover, un = sum(len(x["to_cover"]) for x in plans), sum(len(x["to_uncover"]) for x in plans)
+        n_q = db.level_question_counts(con)[p[3]]
+        text = (f"🎯 <b>Группа {esc(g['name'])} → {p[3]}</b>\nУчеников: {len(members)}. Всего будет отмечено тем: {cover}"
+                + (f", снято: {un}" if un else "") + "."
+                + (f"\n\n⚠️ В банке вопросов уровня {p[3]} всего {n_q}: ученики в основном будут получать вопросы "
+                   "более низкого уровня." if n_q < db.MIN_LEVEL_QUESTIONS else ""))
+        kb = ikb([("✅ Применить ко всей группе", f"gl:ok:{gid}:{p[3]}")], [("⬅️ Назад", f"gl:s:{gid}")])
+    else:
+        me = (player(cb.from_user.id) or {"id": None})["id"]
+        for u in members:
+            plan = db.apply_jump(con, u["id"], p[3], today(), by_user_id=me)
+            await notify_level(cb.bot, u, plan)
+        text, kb = group_card_content(gid, note=f"✅ Вся группа переведена на {p[3]} ({len(members)} уч.).\n\n")
+    await edit(cb, text, kb)
+
+
 # ---------- группы ----------
 def groups_list_content():
     gs = db.groups_overview(con)
@@ -1337,8 +1590,9 @@ def group_card_content(gid, note=""):
     return text, ikb(
         [("👥 Состав", f"st:l:c:g{gid}:0"), ("📈 Отчёт", f"gr:rep:{gid}")],
         [("🗺 Карта группы", f"mp:g:{gid}:0"), ("🧩 Типичные ошибки", f"ms:g{gid}:0")],
+        [("📚 Программа группы", f"gp:{gid}:a:0"), ("🎯 Уровень всей группе", f"gl:s:{gid}")],
         [("➕ Добавить учеников", f"gr:addn:{gid}"), ("🎁 Наградить группу", f"rw:a:g{gid}:p")],
-        [("📝 Задание группе", f"nhw:preg:{gid}"), ("🎯 Уровень", f"gr:lvl:{gid}")],
+        [("📝 Задание группе", f"nhw:preg:{gid}"), ("🏁 Цель группы", f"gr:lvl:{gid}")],
         [("✏️ Название", f"gr:ren:{gid}"), ("🗑 Удалить", f"gr:del:{gid}")],
         [("⬅️ К группам", "gr:l")])
 
@@ -1391,7 +1645,7 @@ async def groups_nav(cb: CallbackQuery, state: FSMContext):
         text = "Напишите <b>новое название</b> группы."
         kb = ikb([("❌ Отмена", f"gr:c:{p[2]}")])
     elif act == "lvl":
-        text = "🎯 <b>Целевой уровень группы</b> (для информации):"
+        text = "🏁 <b>Цель группы</b> (подпись для вас; сам уровень учеников меняет «🎯 Уровень всей группе»):"
         kb = ikb([(c, f"gr:setl:{p[2]}:{c}") for c in db.CEFR], [("Не указывать", f"gr:setl:{p[2]}:-")],
                  [("⬅️ Назад", f"gr:c:{p[2]}")])
     elif act == "setl":

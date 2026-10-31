@@ -63,7 +63,8 @@ def split_text(text, limit=3500):
 def answer_rows(con, since_day, until_day=None, user_id=None, group_id=None):
     """Ответы учеников за период: (user_id, day, is_correct, topic, skill)."""
     sql = ("SELECT e.user_id, e.day, e.is_correct, e.topic, e.skill FROM events e JOIN users u ON u.id=e.user_id "
-           "WHERE e.event_type='answer' AND u.role='student' AND u.is_active=1 AND e.day>=?")
+           "WHERE e.event_type='answer' AND u.role='student' AND u.is_active=1 AND e.day>=? "
+           "AND COALESCE(e.slot,'')<>'new'")
     params = [since_day.isoformat()]
     if until_day:
         sql += " AND e.day<=?"
@@ -245,7 +246,8 @@ def mastery_state(n, acc):
 def topic_mastery(con, user_id=None, group_id=None):
     """{(id ученика, тема): {state, n, ok, acc, total}} по последним ответам темы."""
     sql = ("SELECT e.user_id, e.topic, e.is_correct FROM events e JOIN users u ON u.id=e.user_id "
-           "WHERE e.event_type='answer' AND e.topic IS NOT NULL AND u.role='student' AND u.is_active=1")
+           "WHERE e.event_type='answer' AND e.topic IS NOT NULL AND u.role='student' AND u.is_active=1 "
+           "AND COALESCE(e.slot,'')<>'new'")
     params = []
     if user_id is not None:
         sql += " AND e.user_id=?"
@@ -293,7 +295,7 @@ def common_mistakes(con, since_day, group_id=None, user_id=None, limit=8, min_wr
     sql = ("SELECT e.question_id, e.is_correct, e.answer_given, q.topic, q.cefr, q.question, q.type, q.correct, "
            "q.option_a, q.option_b, q.option_c, q.option_d FROM events e JOIN questions q ON q.id=e.question_id "
            "JOIN users u ON u.id=e.user_id WHERE e.event_type='answer' AND e.day>=? AND u.role='student' "
-           "AND u.is_active=1")
+           "AND u.is_active=1 AND COALESCE(e.slot,'')<>'new'")
     params = [since_day.isoformat()]
     if group_id is not None:
         sql += " AND u.group_id=?"
@@ -330,6 +332,38 @@ def mistakes_text(items, start=1):
             tail += f". Чаще всего выбирали: «{esc(x['top'])}» ({x['top_count']} из {x['recorded']})"
         lines.append(tail)
     return "\n".join(lines)
+
+
+# =====================================================================================
+#  Подсказки по программе
+# =====================================================================================
+def preview_hints(con, user_id):
+    """Непройденные темы, по которым ученик в «разведке» отвечает уверенно: возможно, тему уже знает."""
+    cov = db.covered_topics(con, user_id)
+    out = []
+    for t in db.grammar_topics(con):
+        if cov.get(t["topic"], {}).get("status") == "covered":
+            continue
+        rows = con.execute("SELECT is_correct FROM events WHERE user_id=? AND event_type='answer' AND topic=? AND slot='new' "
+                           "ORDER BY id DESC LIMIT 5", (user_id, t["topic"])).fetchall()
+        ok = sum(r[0] or 0 for r in rows)
+        if len(rows) >= 4 and ok / len(rows) >= 0.85:
+            out.append({"topic": t["topic"], "ok": ok, "n": len(rows)})
+    return out
+
+
+def program_alerts(con, today):
+    """Для дайджеста: кто готов к переходу на следующий уровень и какие темы вернулись «на повтор» за неделю."""
+    ready, relearn = [], []
+    since = (today - timedelta(days=7)).isoformat()
+    for s in con.execute("SELECT id, nickname FROM users WHERE role='student' AND is_active=1 ORDER BY nickname COLLATE NOCASE"):
+        ps = db.program_summary(con, s["id"])
+        if ps["ready"] and ps["next_band"]:
+            ready.append((s["nickname"], ps["band"], ps["next_band"], ps["done"], ps["program"]))
+    for r in con.execute("SELECT u.nickname, st.topic, st.reason FROM student_topics st JOIN users u ON u.id=st.user_id "
+                         "WHERE st.status='relearn' AND substr(st.marked_at,1,10)>=? AND u.is_active=1 ORDER BY st.marked_at DESC", (since,)):
+        relearn.append((r["nickname"], r["topic"], r["reason"]))
+    return ready, relearn
 
 
 # =====================================================================================
@@ -394,6 +428,13 @@ def build_digest(con, today):
         weak = [w for w in sorted((pct(ok, n), t, n) for t, (n, ok) in topics.items() if n >= 10)[:3] if w[0] < 75]
         if weak:
             lines += ["", "<b>Что стоит разобрать на уроке</b>"] + [f"• {esc(t)}: {p}% ({n} отв.)" for p, t, n in weak]
+    ready, relearn = program_alerts(con, today)
+    if relearn:
+        lines += ["", "<b>🔁 Темы вернулись на повтор</b> (стабильные ошибки)"]
+        lines += [f"• {esc(n)}: {esc(t)} — {esc(r or '')}" for n, t, r in relearn[:8]]
+    if ready:
+        lines += ["", "<b>🎓 Готовы к переходу на следующий уровень</b>"]
+        lines += [f"• {esc(n)}: {a_} → {b_} (пройдено {dn} из {pr} тем)" for n, a_, b_, dn, pr in ready[:8]]
     mist = common_mistakes(con, cur_start, limit=3)
     if mist:
         lines += ["", "<b>🧩 Типичные ошибки недели</b>", mistakes_text(mist)]
@@ -539,11 +580,11 @@ def build_export(con, today, path, weeks=8, log_days=180):
     # журнал ответов
     log = con.execute(
         """SELECT e.day, u.nickname, g.name AS grp, e.topic, e.skill, e.cefr, e.question_id, e.is_correct,
-                  e.response_time_ms, e.context FROM events e JOIN users u ON u.id=e.user_id
+                  e.response_time_ms, e.context, e.slot FROM events e JOIN users u ON u.id=e.user_id
            LEFT JOIN groups g ON g.id=u.group_id WHERE e.event_type='answer' AND u.role='student' AND e.day>=?
            ORDER BY e.day, e.id LIMIT 50000""", ((today - timedelta(days=log_days)).isoformat(),)).fetchall()
     _sheet(wb, "Журнал ответов", ["Дата", "Ник", "Группа", "Тема", "Навык", "CEFR", "id вопроса", "Верно (1/0)",
-                                  "Время, мс", "Откуда"], [tuple(r) for r in log], {1: 12, 2: 18, 3: 18, 4: 28})
+                                  "Время, мс", "Откуда", "Слот квиза"], [tuple(r) for r in log], {1: 12, 2: 18, 3: 18, 4: 28})
 
     # типичные ошибки
     mist = common_mistakes(con, today - timedelta(days=60), limit=100, min_wrong=2)
