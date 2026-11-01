@@ -571,6 +571,21 @@ def count_questions(con, topic=None, cefr=None):
     return con.execute(sql, params).fetchone()[0]
 
 
+LONG_EXPLANATION = 600    # пояснение длиннее — на телефоне громоздко
+LONG_QUESTION = 2500      # вопрос вместе с вариантами длиннее — рискует не поместиться в сообщение Telegram
+
+
+def content_warnings(con):
+    """Что в банке стоит поправить: слишком длинные пояснения и вопросы. {'long_expl': [id], 'long_q': [id]}"""
+    out = {"long_expl": [], "long_q": []}
+    for r in con.execute("SELECT id, question, option_a, option_b, option_c, option_d, explanation FROM questions WHERE active=1"):
+        if len(r["explanation"] or "") > LONG_EXPLANATION:
+            out["long_expl"].append(r["id"])
+        if sum(len(r[k] or "") for k in ("question", "option_a", "option_b", "option_c", "option_d")) > LONG_QUESTION:
+            out["long_q"].append(r["id"])
+    return out
+
+
 def similar_topics(con):
     """Названия тем, которые отличаются только регистром или пробелами: скорее всего, опечатка в таблице."""
     groups = {}

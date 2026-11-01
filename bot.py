@@ -456,8 +456,20 @@ async def drop_card(bot: Bot, chat_id, d):
             pass
 
 
+CARD_LIMIT = 3800        # лимит Telegram на сообщение 4096 символов; оставляем запас на разметку
+
+
+def fit_text(text):
+    """Последняя страховка: слишком длинный текст обрезается по строке (теги в наших карточках не пересекают строки)."""
+    if len(text) <= CARD_LIMIT + 200:
+        return text
+    cut = text.rfind("\n", 0, CARD_LIMIT + 100)
+    return text[: cut if cut > 0 else CARD_LIMIT] + "\n…(текст сокращён)"
+
+
 async def render_card(bot: Bot, chat_id, state: FSMContext, text, kb=None, new=False):
     """Показывает карточку квиза: правит существующее сообщение (или создаёт новое)."""
+    text = fit_text(text)
     d = await state.get_data()
     cid = d.get("card_id")
     if cid and not new:
@@ -641,7 +653,8 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
              f"Твой ответ: {esc(shown)}"]
     if not ok:
         lines.append(f"Правильно: <b>{esc(db.correct_display(q))}</b>")
-    if q["explanation"]:
+    expl_at = len(lines) if q["explanation"] else None
+    if expl_at is not None:
         lines.append(f"💡 {esc(q['explanation'])}")
     lines.append(f"<i>+{gain} XP</i>")
     rows = []
@@ -653,6 +666,11 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
             rows.append([("📖 Памятка по теме", f"memq:{sheet['id']}")])
     if last:  # итог квиза показываем в той же карточке
         lines += ["", "━━━━━━━━━━", finalize_quiz(u, d2)]
+    if expl_at is not None:   # длинное пояснение сокращаем, чтобы карточка поместилась в лимит Telegram
+        expl = q["explanation"].strip()
+        while len("\n".join(lines)) > CARD_LIMIT and expl:
+            expl = expl[: int(len(expl) * 0.8)].rstrip()
+            lines[expl_at] = f"💡 {esc(expl)}…" if expl else "💡 (пояснение слишком длинное, спроси учителя)"
     await render_card(bot, chat_id, state, "\n".join(lines), ikb(*rows) if rows else None)
     if last:
         await state.clear()
@@ -2644,6 +2662,14 @@ async def on_document(m: Message, bot: Bot):
     text = f"✅ Загружено вопросов: {q_ok}, памяток: {c_ok}. Тем в банке: {len(db.topic_stats(con))}"
     if problems:
         text += f"\n⚠️ Пропущено строк: {len(problems)}\n" + "\n".join(esc(p) for p in problems[:15])
+    warn = db.content_warnings(con)
+    if warn["long_expl"]:
+        text += (f"\n\n⚠️ Длинных пояснений (больше {db.LONG_EXPLANATION} символов): {len(warn['long_expl'])}, например id "
+                 f"{', '.join(map(str, warn['long_expl'][:5]))}. Telegram их выдержит, но на телефоне это громоздко: "
+                 "лучше 150–350 символов.")
+    if warn["long_q"]:
+        text += (f"\n⚠️ Слишком длинные вопросы с вариантами (больше {db.LONG_QUESTION} символов): "
+                 f"id {', '.join(map(str, warn['long_q'][:5]))}: они могут не поместиться в сообщение.")
     similar = db.similar_topics(con)
     if similar:
         text += ("\n\n⚠️ <b>Похожие названия тем</b> (отличаются регистром или пробелами, бот считает их разными, "
