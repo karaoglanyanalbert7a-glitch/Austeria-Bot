@@ -86,12 +86,20 @@ class RW(StatesGroup):         # ввод своего числа или при�
     reason = State()
 
 
+class Prize(StatesGroup):      # магазин: название, цена нового приза и новая цена
+    title = State()
+    price = State()
+    edit_price = State()
+
+
 BTN_QUIZ, BTN_PROFILE, BTN_MEMO, BTN_HW = "🎯 Квиз", "👤 Профиль", "📖 Памятки", "📝 Домашка"
+BTN_SHOP = "🛍 Магазин"
 BTN_STUDENTS, BTN_NEWHW = "👥 Ученики", "➕ Новое задание"     # BTN_NEWHW: только для старых клавиатур
 BTN_GROUPS, BTN_TASKS, BTN_REWARDS, BTN_PANEL = "🏷 Группы", "📝 Задания", "🎁 Награды", "📊 Сводка"
 MENU_STUDENT = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=BTN_QUIZ), KeyboardButton(text=BTN_PROFILE)],
-              [KeyboardButton(text=BTN_MEMO), KeyboardButton(text=BTN_HW)]], resize_keyboard=True)
+              [KeyboardButton(text=BTN_MEMO), KeyboardButton(text=BTN_HW)],
+              [KeyboardButton(text=BTN_SHOP)]], resize_keyboard=True)
 MENU_TEACHER = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=BTN_STUDENTS), KeyboardButton(text=BTN_GROUPS)],
               [KeyboardButton(text=BTN_TASKS), KeyboardButton(text=BTN_REWARDS)],
@@ -137,6 +145,7 @@ STUDENT_COMMANDS = [BotCommand(command="quiz", description="Начать кви�
                     BotCommand(command="profile", description="Мой профиль"),
                     BotCommand(command="memo", description="Памятки по темам"),
                     BotCommand(command="hw", description="Домашние задания"),
+                    BotCommand(command="shop", description="Магазин призов"),
                     BotCommand(command="help", description="Помощь")]
 TEACHER_COMMANDS = [BotCommand(command="hw", description="Задания и кто сдал"),
                     BotCommand(command="newhw", description="Создать задание"),
@@ -302,7 +311,9 @@ async def cmd_help(m: Message):
                    "Незаконченный квиз живёт до конца дня, завтра будет новый.\n"
                    "👤 <b>Профиль</b> — твой уровень, серия и навыки.\n"
                    "📖 <b>Памятки</b> — краткие правила по темам.\n"
-                   "📝 <b>Домашка</b> — задания от учителя.")
+                   "📝 <b>Домашка</b> — задания от учителя.\n"
+                   "🛍 <b>Магазин</b> — призы за монеты, которые ты зарабатываешь верными ответами и значками.\n"
+                   "🔁 Вопросы, на которых ты ошибся, возвращаются в квизе через 1, 3, 7 и 14 дней, пока ты их не запомнишь.")
 
 
 # ======================= профиль =======================
@@ -312,7 +323,8 @@ def bar(cur, total, width=10):
 
 
 def profile_kb(remind):
-    return ikb([(f"🔔 Напоминания: {'включены ✅' if remind else 'выключены 🔕'}", "rem:toggle")],
+    return ikb([("🏅 Все значки", "bd:list")],
+               [(f"🔔 Напоминания: {'включены ✅' if remind else 'выключены 🔕'}", "rem:toggle")],
                [("✖️ Закрыть", "close")])
 
 
@@ -344,6 +356,13 @@ async def profile(m: Message):
         lines.append(f"📚 Программа {ps['band']}: пройдено {ps['done']} из {ps['program']} тем")
     if capped and ps["next_band"]:
         lines.append(f"🔒 Чтобы перейти на {ps['next_band']}, нужно пройти программу {ps['band']}")
+    badges = db.user_badges(con, u["id"])
+    if badges:
+        lines.append("🏅 Значки: " + "".join(db.BADGES[c][0] for c in badges if c in db.BADGES)
+                     + f" ({len(badges)} из {len(db.BADGES)})")
+    n_err, due_err = db.error_stats(con, u["id"], today())
+    if n_err:
+        lines.append(f"🔁 Ошибок на повторе: {n_err}")
     lines += [f"📅 Квиз дня: {daily}", f"🪙 Монеты: {ch['coins']}",
               f"🔥 Серия: {db.effective_streak(ch, today())} дн. · ❄️ заморозок: {ch['freezes']}",
               f"\n📚 Словарь: {ch['vocabulary']} · 🧩 Грамматика: {ch['grammar']}\n"
@@ -444,6 +463,8 @@ def q_header(d, q, pos):
     tag = {"practice": " · 🏋️ тренировка", "homework_late": " · ⏰ после дедлайна"}.get(d["context"], "")
     if slot_of(d, pos) == "new":
         tag += " · 🆕 новая тема"
+    elif slot_of(d, pos) == "error":
+        tag += " · 🔁 повтор ошибки"
     return (f"<b>{prefix}Вопрос {pos + 1}/{len(d['qids'])}</b> · {esc(q['topic'])} · {q['cefr']}{tag}\n\n"
             f"{esc(q['question'])}")
 
@@ -612,7 +633,7 @@ async def on_next(cb: CallbackQuery, state: FSMContext):
 
 
 @router.message(Quiz.text_answer, F.text, ~F.text.startswith("/"),
-                F.text.not_in({BTN_QUIZ, BTN_PROFILE, BTN_MEMO, BTN_HW}))
+                F.text.not_in({BTN_QUIZ, BTN_PROFILE, BTN_MEMO, BTN_HW, BTN_SHOP}))
 async def on_text_answer(m: Message, state: FSMContext):
     d = await state.get_data()
     await tidy(m)  # введённый ответ показывается в карточке, из чата убираем
@@ -643,6 +664,9 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
                  cefr=q["cefr"], is_correct=int(ok), response_time_ms=ms, context=ctx, answer_given=chosen, slot=slot)
     if slot != "new":
         db.check_relearn(con, u["id"], q["topic"])     # стабильные ошибки возвращают тему «на повтор»
+    qres = db.update_error_queue(con, u["id"], q["id"], ok, today(), slot)   # кладбище ошибок
+    if qres == "graduated":
+        db.log_event(con, u["id"], "error_fixed", today(), question_id=q["id"], topic=q["topic"])
     if d.get("hw_id"):
         db.hw_record_answer(con, d["hw_id"], u["id"], q["id"], ok)
     d2 = {**d, "correct": d["correct"] + int(ok), "xp": d["xp"] + gain, "coins": d["coins"] + coins}
@@ -656,6 +680,12 @@ async def process_answer(bot: Bot, chat_id, tg_id, state: FSMContext, given: str
     expl_at = len(lines) if q["explanation"] else None
     if expl_at is not None:
         lines.append(f"💡 {esc(q['explanation'])}")
+    if qres == "graduated":
+        lines.append("🏁 Эта ошибка исправлена окончательно!")
+    elif qres == "advanced":
+        lines.append("✅ Повтор засчитан: ошибка почти исправлена")
+    elif qres == "queued":
+        lines.append("📌 Вернёмся к этому вопросу завтра")
     lines.append(f"<i>+{gain} XP</i>")
     rows = []
     if not last:
@@ -703,6 +733,9 @@ def finalize_quiz(u, d) -> str:
         lines = [f"🏁 <b>Квиз завершён!</b> Верно: {d['correct']}/{n}",
                  f"+{d['xp']} XP" + (f" · +{d['coins']} 🪙" if d["coins"] else "")]
     streak, used, earned = db.update_streak(con, u["id"], today())
+    total_q = len(d["qids"])
+    new_badges = db.check_badges(con, u["id"], today(),
+                                 perfect=(not hw_id) and d["correct"] == total_q and total_q >= 5)
     ch = db.get_character(con, u["id"])
     if ch["level"] > d["lvl0"]:
         lines.append(f"🎉 <b>Новый уровень: {ch['level']}</b> ({db.cefr_for_level(ch['level'])})")
@@ -711,7 +744,119 @@ def finalize_quiz(u, d) -> str:
         lines.append("❄️ Заморозка спасла твою серию!")
     if earned:
         lines.append("🎁 +1 заморозка за 7 дней подряд!")
+    if new_badges:
+        lines.append("🏅 Новый значок: " + ", ".join(f"{db.BADGES[c][0]} {db.BADGES[c][1]}" for c in new_badges)
+                     + f" (+{db.BADGE_COINS * len(new_badges)} 🪙)")
     return "\n".join(lines)
+
+
+# ======================= магазин призов (ученик) =======================
+def shop_list_content(u, page=0):
+    ch = db.get_character(con, u["id"])
+    prizes = db.list_prizes(con, only_active=True)
+    head = f"🛍 <b>Магазин призов</b>\nУ тебя 🪙 {ch['coins']}. Монеты даются за верные ответы, значки и награды учителя."
+    if not prizes:
+        return head + "\n\nПризов пока нет. Загляни позже!", ikb([("🧾 Мои покупки", "shop:my")], [("✖️ Закрыть", "close")])
+    pages = max(1, -(-len(prizes) // PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = [[(f"{'🔒 ' if ch['coins'] < p['price'] else ''}{p['title'][:30]} · {p['price']} 🪙", f"shop:p:{p['id']}:{page}")]
+            for p in prizes[page * PAGE:(page + 1) * PAGE]]
+    rows += nav_row(page, pages, "shop:l")
+    rows += [[("🧾 Мои покупки", "shop:my")], [("✖️ Закрыть", "close")]]
+    return head + "\n🔒 — пока не хватает монет.", ikb(*rows)
+
+
+@router.message(Command("shop"))
+@router.message(F.text == BTN_SHOP)
+async def shop_open(m: Message):
+    u = player(m.from_user.id)
+    await tidy(m)
+    if not u:
+        await m.answer("Сначала нажми /start")
+        return
+    text, kb = shop_list_content(u)
+    await m.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("shop:"))
+async def shop_nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    u = player(cb.from_user.id)
+    if not u:
+        await cb.answer()
+        return
+    act = p[1]
+    if act == "l":
+        await cb.answer()
+        text, kb = shop_list_content(u, int(p[2]))
+    elif act == "my":
+        await cb.answer()
+        icon = {"new": "🕐 ждёт выдачи", "done": "✅ выдан", "cancelled": "↩️ отменён, монеты возвращены"}
+        rows = db.user_purchases(con, u["id"])
+        text = "🧾 <b>Мои покупки</b>\n\n" + ("\n".join(f"• {esc(r['title'])} · {r['price']} 🪙 — {icon[r['status']]}" for r in rows)
+                                              if rows else "Пока ничего не куплено.")
+        kb = ikb([("⬅️ В магазин", "shop:l:0")])
+    elif act in ("p", "b"):
+        prize = db.get_prize(con, int(p[2]))
+        ch = db.get_character(con, u["id"])
+        if not prize or not prize["active"] or (prize["stock"] is not None and prize["stock"] <= 0):
+            await cb.answer("Этого приза уже нет.", show_alert=True)
+            return
+        await cb.answer()
+        back = ("⬅️ В магазин", f"shop:l:{p[3]}")
+        if act == "p":
+            text = (f"🎁 <b>{esc(prize['title'])}</b>\n" + (f"{esc(prize['description'])}\n" if prize["description"] else "")
+                    + f"\nЦена: {prize['price']} 🪙 · у тебя {ch['coins']} 🪙"
+                    + (f"\nОсталось: {prize['stock']}" if prize["stock"] is not None else ""))
+            if ch["coins"] >= prize["price"]:
+                kb = ikb([(f"✅ Купить за {prize['price']} 🪙", f"shop:b:{prize['id']}:{p[3]}")], [back])
+            else:
+                text += f"\n\n🔒 Не хватает {prize['price'] - ch['coins']} 🪙. Занимайся каждый день: монеты капают за верные ответы."
+                kb = ikb([back])
+        else:
+            text = (f"Купить <b>{esc(prize['title'])}</b> за {prize['price']} 🪙?\nМонеты спишутся сразу, а учитель получит "
+                    "заявку и выдаст приз.")
+            kb = ikb([("✅ Да, купить", f"shop:ok:{prize['id']}")], [("❌ Нет", f"shop:p:{prize['id']}:{p[3]}")])
+    else:   # ok: покупка
+        pid, err = db.buy_prize(con, u["id"], int(p[2]), today())
+        if err:
+            await cb.answer(err, show_alert=True)
+            return
+        await cb.answer("Куплено! 🎉")
+        purchase = db.get_purchase(con, pid)
+        for tid in TEACHERS:
+            try:
+                await cb.bot.send_message(tid, f"🛍 <b>Заявка на приз</b>\n{esc(u['nickname'])} купил(а): "
+                                               f"<b>{esc(purchase['title'])}</b> за {purchase['price']} 🪙",
+                                          reply_markup=ikb([("✅ Выдано", f"sh:done:{pid}"), ("❌ Отменить", f"sh:cancel:{pid}")]))
+            except Exception:
+                logging.warning("Не удалось отправить заявку учителю %s", tid)
+        text = (f"🎉 <b>Куплено: {esc(purchase['title'])}!</b>\nУчитель получил заявку и выдаст приз. "
+                f"Осталось 🪙 {db.get_character(con, u['id'])['coins']}.")
+        kb = ikb([("🛍 В магазин", "shop:l:0")], [("✖️ Закрыть", "close")])
+    await edit(cb, text, kb)
+
+
+@router.callback_query(F.data == "bd:list")
+async def badges_list(cb: CallbackQuery):
+    u = player(cb.from_user.id)
+    await cb.answer()
+    if not u:
+        return
+    have = db.user_badges(con, u["id"])
+    lines = [f"🏅 <b>Значки</b> ({len(have)} из {len(db.BADGES)}). За каждый новый +{db.BADGE_COINS} 🪙", ""]
+    for code, (icon, name, how) in db.BADGES.items():
+        lines.append(f"✅ {icon} {name}" if code in have else f"🔒 {icon} {name}: {how}")
+    await edit(cb, "\n".join(lines), ikb([("⬅️ Профиль", "bd:back")]))
+
+
+@router.callback_query(F.data == "bd:back")
+async def badges_back(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
 
 
 # ======================= домашние задания: ученик =======================
@@ -938,7 +1083,7 @@ async def teacher_screen(m: Message, state: FSMContext, text, kb):
 @teacher.message(Command("profile"))
 @teacher.message(Command("quiz"))
 @teacher.message(Command("memo"))
-@teacher.message(F.text.in_({BTN_PANEL, BTN_PROFILE, BTN_QUIZ, BTN_MEMO}))
+@teacher.message(F.text.in_({BTN_PANEL, BTN_PROFILE, BTN_QUIZ, BTN_MEMO, BTN_SHOP}))
 async def t_panel(m: Message, state: FSMContext):
     text, kb = panel_content()
     await teacher_screen(m, state, text, kb)
@@ -1016,6 +1161,9 @@ def panel_content():
         rows.append([(f"📥 На проверке ({s['pending']})", "rv:list")])
     if flags:
         rows.append([(f"⚠️ Кому нужно внимание ({len(flags)})", "tp:flags")])
+    n_orders = len(db.pending_purchases(con))
+    if n_orders:
+        rows.append([(f"🛍 Заявки на призы ({n_orders})", "sh:q")])
     rows.append([("📬 Дайджест сейчас", "tp:digest"), ("🧩 Типичные ошибки", "ms:a:0")])
     rows.append([("📤 Экспорт в Excel", "tp:export"), ("🔔 Автоматика", "tp:auto")])
     rows.append([("💾 Копия базы", "tp:backup"), ("⌨️ Команды", "tp:cmds")])
@@ -1216,6 +1364,8 @@ def student_card_content(uid, back):
     text += (f"\n📚 Программа {ps['band']}: пройдено {ps['done']} из {ps['program']} тем"
              + (f" · 🔁 на повтор: {len(ps['relearn'])}" if ps["relearn"] else "")
              if ps["covered_total"] else "\n📚 Программа не заполнена: квизы идут только по уровню")
+    n_err, due_err = db.error_stats(con, uid, today())
+    text += f"\n🏅 Значков: {len(db.user_badges(con, uid))} · 🔁 ошибок на повторе: {n_err}"
     if ps["ready"] and ps["next_band"]:
         text += f"\n🎓 Прошёл(ла) почти всю программу: можно перевести на {ps['next_band']}"
     return text, ikb([("📈 Отчёт", f"st:r:{uid}:{back}"), ("🗺 Карта тем", f"mp:s:{uid}:{back}:0")],
@@ -1473,8 +1623,10 @@ async def topics_mark_nav(cb: CallbackQuery):
 
 
 async def notify_level(bot: Bot, u, plan):
+    extra = ("\n🏅 Новый значок: " + ", ".join(f"{db.BADGES[c][0]} {db.BADGES[c][1]}" for c in plan.get("badges", []))
+             if plan.get("badges") else "")
     await notify_student(bot, u, f"🎓 Учитель перевёл тебя на уровень <b>{plan['cefr']}</b> (ур. {plan['level']}). "
-                                 "Квизы теперь подстроятся под него. Удачи!")
+                                 f"Квизы теперь подстроятся под него. Удачи!{extra}")
 
 
 @teacher.callback_query(F.data.startswith("lv:"))
@@ -1581,6 +1733,156 @@ async def group_level_nav(cb: CallbackQuery):
             await notify_level(cb.bot, u, plan)
         text, kb = group_card_content(gid, note=f"✅ Вся группа переведена на {p[3]} ({len(members)} уч.).\n\n")
     await edit(cb, text, kb)
+
+
+# ---------- магазин призов (учитель) ----------
+def prize_line(p):
+    stock = f" · ост. {p['stock']}" if p["stock"] is not None else ""
+    return f"{'👁' if p['active'] else '🚫'} {p['title'][:26]} · {p['price']} 🪙{stock}"
+
+
+def shop_admin_content(page=0):
+    prizes = con.execute("SELECT * FROM prizes WHERE deleted=0 ORDER BY active DESC, price, id").fetchall()
+    n_orders = len(db.pending_purchases(con))
+    pages = max(1, -(-len(prizes) // PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = [[(prize_line(p), f"sh:c:{p['id']}:{page}")] for p in prizes[page * PAGE:(page + 1) * PAGE]]
+    rows += nav_row(page, pages, "sh:l")
+    rows.append([("➕ Новый приз", "sh:new")])
+    if n_orders:
+        rows.append([(f"📥 Заявки ({n_orders})", "sh:q")])
+    rows.append([("⬅️ К наградам", "rw:m")])
+    text = ("🛍 <b>Магазин призов</b>\nУченики покупают призы за монеты (🪙); вы получаете заявку и выдаёте приз. "
+            f"Призов: {len(prizes)}. 👁 в продаже · 🚫 скрыт.\nПримеры: «Выбрать тему урока», «Пропуск одной домашки», «Сладкий приз».")
+    return text, ikb(*rows)
+
+
+def prize_card_content(pid, page=0):
+    p = db.get_prize(con, pid)
+    if not p:
+        return "Приз не найден.", ikb([("⬅️ К списку", f"sh:l:{page}")])
+    text = (f"🎁 <b>{esc(p['title'])}</b>\nЦена: {p['price']} 🪙 · "
+            + (f"на складе: {p['stock']}" if p["stock"] is not None else "без ограничения")
+            + f" · {'в продаже' if p['active'] else 'скрыт'}")
+    return text, ikb([("💰 Цена", f"sh:price:{pid}"), ("📦 Количество", f"sh:stock:{pid}")],
+                     [("🚫 Скрыть" if p["active"] else "👁 Показать", f"sh:tog:{pid}:{page}"),
+                      ("🗑 Удалить", f"sh:del:{pid}:{page}")],
+                     [("⬅️ К списку", f"sh:l:{page}")])
+
+
+def orders_content():
+    rows = db.pending_purchases(con)
+    back = [("⬅️ К магазину", "sh:l:0")]
+    if not rows:
+        return "📥 Заявок нет: все призы выданы.", ikb(back)
+    kb = [[(f"{r['nickname']} — {r['title'][:24]} · {r['price']} 🪙", f"sh:o:{r['id']}")] for r in rows[:25]]
+    return f"📥 <b>Заявки на призы ({len(rows)})</b>\nНажмите, чтобы выдать или отменить.", ikb(*kb, back)
+
+
+@teacher.callback_query(F.data.startswith("sh:"))
+async def shop_admin_nav(cb: CallbackQuery, state: FSMContext):
+    p = cb.data.split(":")
+    act, toast = p[1], None
+    if act in ("l", "c", "q"):
+        await state.clear()
+    if act == "l":
+        text, kb = shop_admin_content(int(p[2]))
+    elif act == "c":
+        text, kb = prize_card_content(int(p[2]), int(p[3]))
+    elif act == "q":
+        text, kb = orders_content()
+    elif act == "new":
+        await state.clear()
+        await state.set_state(Prize.title)
+        await state.update_data(prompt_id=cb.message.message_id)
+        text, kb = "Напишите <b>название</b> приза (например: «Выбрать тему урока»).", ikb([("❌ Отмена", "sh:l:0")])
+    elif act == "price":
+        await state.set_state(Prize.edit_price)
+        await state.update_data(prompt_id=cb.message.message_id, pid=int(p[2]))
+        text, kb = "Напишите новую <b>цену</b> в монетах (число от 1 до 9999).", ikb([("❌ Отмена", f"sh:c:{p[2]}:0")])
+    elif act == "stock":
+        text = "📦 Сколько штук на складе? «Без ограничения» означает, что приз не заканчивается."
+        kb = ikb([("∞ Без ограничения", f"sh:stk:{p[2]}:n")], [(str(n), f"sh:stk:{p[2]}:{n}") for n in (1, 3, 5, 10)],
+                 [("⬅️ Назад", f"sh:c:{p[2]}:0")])
+    elif act == "stk":
+        db.update_prize(con, int(p[2]), stock=None if p[3] == "n" else int(p[3]))
+        toast = "Сохранено"
+        text, kb = prize_card_content(int(p[2]))
+    elif act == "tog":
+        pr = db.get_prize(con, int(p[2]))
+        db.update_prize(con, int(p[2]), active=0 if pr["active"] else 1)
+        toast = "Скрыт" if pr["active"] else "В продаже"
+        text, kb = prize_card_content(int(p[2]), int(p[3]))
+    elif act == "del":
+        pr = db.get_prize(con, int(p[2]))
+        text = f"🗑 Удалить приз «{esc(pr['title'])}»? Уже купленные заявки сохранятся."
+        kb = ikb([("✅ Да, удалить", f"sh:delok:{p[2]}:{p[3]}"), ("❌ Нет", f"sh:c:{p[2]}:{p[3]}")])
+    elif act == "delok":
+        db.update_prize(con, int(p[2]), deleted=1, active=0)
+        toast = "Удалено"
+        text, kb = shop_admin_content(int(p[3]))
+    elif act == "o":
+        pu = db.get_purchase(con, int(p[2]))
+        if not pu or pu["status"] != "new":
+            await cb.answer("Эта заявка уже обработана.", show_alert=True)
+            return
+        buyer = user_by_id(pu["user_id"])
+        text = f"🛍 <b>Заявка #{pu['id']}</b>\n{esc(buyer['nickname'])} купил(а): <b>{esc(pu['title'])}</b> за {pu['price']} 🪙"
+        kb = ikb([("✅ Выдано", f"sh:done:{pu['id']}"), ("❌ Отменить и вернуть монеты", f"sh:cancel:{pu['id']}")],
+                 [("⬅️ К заявкам", "sh:q")])
+    else:   # done / cancel
+        pu = db.finish_purchase(con, int(p[2]), cancel=(act == "cancel"))
+        if not pu:
+            await cb.answer("Эта заявка уже обработана.", show_alert=True)
+            return
+        buyer = user_by_id(pu["user_id"])
+        if act == "done":
+            await notify_student(cb.bot, buyer, f"🎁 Твой приз «{esc(pu['title'])}» выдан! Приятного пользования.")
+            text = f"✅ Выдано: {esc(buyer['nickname'])} — {esc(pu['title'])}."
+        else:
+            await notify_student(cb.bot, buyer, f"↩️ Покупка «{esc(pu['title'])}» отменена, {pu['price']} 🪙 возвращены.")
+            text = f"↩️ Отменено: {esc(buyer['nickname'])} — {esc(pu['title'])}. Монеты возвращены."
+        kb = ikb([("📥 К заявкам", "sh:q")])
+    await cb.answer(toast)
+    await edit(cb, text, kb)
+
+
+@teacher.message(Prize.title, F.text, ~F.text.startswith("/"))
+async def prize_title_input(m: Message, state: FSMContext):
+    await tidy(m)
+    await state.update_data(title=m.text.strip()[:60])
+    await state.set_state(Prize.price)
+    await edit_prompt(m.bot, m.chat.id, state, f"Приз «{esc(m.text.strip()[:60])}». Напишите <b>цену</b> в монетах "
+                      "(число от 1 до 9999). Для ориентира: за один квиз ученик получает до 8 🪙.",
+                      ikb([("❌ Отмена", "sh:l:0")]))
+
+
+@teacher.message(Prize.price, F.text, ~F.text.startswith("/"))
+async def prize_price_input(m: Message, state: FSMContext):
+    await tidy(m)
+    d = await state.get_data()
+    if not m.text.strip().isdigit() or not 1 <= int(m.text.strip()) <= 9999:
+        await edit_prompt(m.bot, m.chat.id, state, "Нужно целое число от 1 до 9999. Попробуйте ещё раз.",
+                          ikb([("❌ Отмена", "sh:l:0")]))
+        return
+    pid = db.create_prize(con, d["title"], int(m.text.strip()))
+    text, kb = prize_card_content(pid)
+    await edit_prompt(m.bot, m.chat.id, state, "✅ Приз создан. По умолчанию без ограничения по количеству.\n\n" + text, kb)
+    await state.clear()
+
+
+@teacher.message(Prize.edit_price, F.text, ~F.text.startswith("/"))
+async def prize_edit_price_input(m: Message, state: FSMContext):
+    await tidy(m)
+    d = await state.get_data()
+    if not m.text.strip().isdigit() or not 1 <= int(m.text.strip()) <= 9999:
+        await edit_prompt(m.bot, m.chat.id, state, "Нужно целое число от 1 до 9999. Попробуйте ещё раз.",
+                          ikb([("❌ Отмена", f"sh:c:{d['pid']}:0")]))
+        return
+    db.update_prize(con, d["pid"], price=int(m.text.strip()))
+    text, kb = prize_card_content(d["pid"])
+    await edit_prompt(m.bot, m.chat.id, state, "✅ Цена изменена.\n\n" + text, kb)
+    await state.clear()
 
 
 # ---------- группы ----------
@@ -1755,7 +2057,8 @@ def tgt_info(tgt):
 
 
 def rewards_main_content():
-    return "🎁 <b>Награды и штрафы.</b> Кому?", ikb([("👤 Ученику", "st:f:r")], [("🏷 Всей группе", "rw:gl")])
+    return "🎁 <b>Награды и штрафы.</b> Кому?", ikb([("👤 Ученику", "st:f:r")], [("🏷 Всей группе", "rw:gl")],
+                                                    [("🛍 Магазин призов", "sh:l:0")])
 
 
 def reasons_content(tgt, sign, kind, amount):
@@ -2551,7 +2854,8 @@ def accept_manual(teacher_row, u, hw):
     tid = teacher_row["id"] if teacher_row else None
     xp = db.adjust(con, u["id"], "xp", db.HW_MANUAL_XP, reason, tid, today())
     coins = db.adjust(con, u["id"], "coins", db.HW_MANUAL_COINS, reason, tid, today())
-    return f"+{xp} XP, +{coins} 🪙"
+    got = db.check_badges(con, u["id"], today())
+    return f"+{xp} XP, +{coins} 🪙" + (" · 🏅 " + ", ".join(db.BADGES[c][1] for c in got) if got else "")
 
 
 @teacher.callback_query(F.data.startswith("hwr:"))

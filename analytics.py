@@ -473,6 +473,14 @@ def build_digest(con, today):
                         f"выполнили {done}/{len(prog)}" + (f", ждёт проверки: {waiting}" if waiting else ""))
     if hw_lines:
         lines += ["", "<b>📝 Домашние задания</b>"] + hw_lines[:8]
+    bad = con.execute("SELECT u.nickname, COUNT(*) c FROM badges b JOIN users u ON u.id=b.user_id "
+                      "WHERE substr(b.ts,1,10)>=? GROUP BY b.user_id ORDER BY c DESC, u.nickname LIMIT 5",
+                      (cur_start.isoformat(),)).fetchall()
+    if bad:
+        lines += ["", "<b>🏅 Новые значки за неделю:</b> " + ", ".join(f"{esc(r['nickname'])} ({r['c']})" for r in bad)]
+    pend = len(db.pending_purchases(con))
+    if pend:
+        lines += ["", f"🛍 Ждут выдачи призов: {pend}"]
     # динамика
     dyn = weekly_lines(con, end)          # последняя строка — неделя, закончившаяся вчера
     if dyn:

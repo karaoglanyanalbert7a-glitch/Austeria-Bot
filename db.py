@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS topic_info (
 CREATE TABLE IF NOT EXISTS student_topics (
     user_id INTEGER NOT NULL REFERENCES users(id), topic TEXT NOT NULL, status TEXT NOT NULL,
     marked_at TEXT NOT NULL, source TEXT, reason TEXT, PRIMARY KEY (user_id, topic));
+CREATE TABLE IF NOT EXISTS error_queue (
+    user_id INTEGER NOT NULL REFERENCES users(id), question_id INTEGER NOT NULL, step INTEGER NOT NULL DEFAULT 0,
+    due TEXT NOT NULL, added TEXT NOT NULL, PRIMARY KEY (user_id, question_id));
+CREATE TABLE IF NOT EXISTS badges (
+    user_id INTEGER NOT NULL REFERENCES users(id), code TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY (user_id, code));
+CREATE TABLE IF NOT EXISTS prizes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT, price INTEGER NOT NULL,
+    stock INTEGER, active INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0, created_at TEXT);
+CREATE TABLE IF NOT EXISTS purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), prize_id INTEGER NOT NULL,
+    title TEXT NOT NULL, price INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'new', ts TEXT NOT NULL, done_at TEXT);
 CREATE TABLE IF NOT EXISTS job_runs (
     job TEXT NOT NULL, key TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY (job, key));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -992,6 +1003,7 @@ def apply_jump(con, user_id, cefr, day, by_user_id=None):
               extra=json.dumps({"from": plan["band_old"], "to": cefr, "level": plan["level"], "xp": plan["xp"],
                                 "covered": len(plan["to_cover"]), "uncovered": len(plan["to_uncover"]),
                                 "by": by_user_id}, ensure_ascii=False))
+    plan["badges"] = check_badges(con, user_id, day)
     return plan
 
 
@@ -1017,6 +1029,13 @@ def compose_quiz(con, user_id, size=8, today=None):
     covered = {t for t, r in cov.items() if r["status"] == "covered"}
     relearn = {t for t, r in cov.items() if r["status"] == "relearn"}
     chosen, used_q, used_t = [], set(), set()
+    # кладбище ошибок: вопросы, которые пора повторить (но только допустимого уровня и активные)
+    by_id = {q["id"]: q for q in questions}
+    for qid in due_errors(con, user_id, today)[:ERRORS_PER_QUIZ.get(size, 2 if size >= 8 else 1)]:
+        if qid in by_id and len(chosen) < size - 2:
+            chosen.append(dict(by_id[qid], slot="error"))
+            used_q.add(qid)
+            used_t.add(by_id[qid]["topic"])
 
     # насколько каждой пройденной теме нужно повторение: слабая или давно не встречалась
     last_day = {r[0]: r[1] for r in con.execute(
@@ -1056,7 +1075,7 @@ def compose_quiz(con, user_id, size=8, today=None):
             used_t.add(q["topic"])
 
     if not covered and not relearn:                           # программа ещё не заполнена: только по уровням
-        pick(questions, size, "level")
+        pick(questions, size - len(chosen), "level")
     else:
         info = {t["topic"]: t for t in grammar_topics(con)}
         n_new = 0 if size < 3 else (2 if size >= 8 else 1)
@@ -1083,3 +1102,195 @@ def compose_quiz(con, user_id, size=8, today=None):
                 chosen[0], chosen[i] = chosen[i], chosen[0]
                 break
     return chosen[:size]
+
+
+# =====================================================================================
+#  Кладбище ошибок: вопросы, на которых ученик ошибся, возвращаются с нарастающими интервалами
+# =====================================================================================
+ERROR_STEPS = [1, 3, 7, 14]     # через сколько дней повторять: после ошибки, потом после каждого верного повтора
+ERRORS_PER_QUIZ = {8: 2, 5: 1}  # сколько «просроченных» ошибок подмешивать в квиз
+
+
+def update_error_queue(con, user_id, question_id, ok, today, slot=None):
+    """Ошибка ставит вопрос в очередь повторения, верный ответ в срок продвигает его, после 4 повторов вопрос
+    «выпускается». Ответы по новым темам (разведка) в очередь не попадают. Возвращает queued/advanced/graduated/None."""
+    if slot == "new":
+        return None
+    row = con.execute("SELECT * FROM error_queue WHERE user_id=? AND question_id=?", (user_id, question_id)).fetchone()
+    if not ok:
+        due = (today + timedelta(days=ERROR_STEPS[0])).isoformat()
+        con.execute("INSERT INTO error_queue (user_id, question_id, step, due, added) VALUES (?,?,0,?,?) "
+                    "ON CONFLICT(user_id, question_id) DO UPDATE SET step=0, due=excluded.due",
+                    (user_id, question_id, due, today.isoformat()))
+        con.commit()
+        return "queued"
+    if not row or row["due"] > today.isoformat():       # верный ответ раньше срока не засчитываем как повтор
+        return None
+    step = row["step"] + 1
+    if step >= len(ERROR_STEPS):
+        con.execute("DELETE FROM error_queue WHERE user_id=? AND question_id=?", (user_id, question_id))
+        con.commit()
+        return "graduated"
+    con.execute("UPDATE error_queue SET step=?, due=? WHERE user_id=? AND question_id=?",
+                (step, (today + timedelta(days=ERROR_STEPS[step])).isoformat(), user_id, question_id))
+    con.commit()
+    return "advanced"
+
+
+def error_stats(con, user_id, today):
+    """(всего в очереди повторения, из них пора повторять сегодня)."""
+    r = con.execute("SELECT COUNT(*), COALESCE(SUM(due<=?),0) FROM error_queue WHERE user_id=?",
+                    (today.isoformat(), user_id)).fetchone()
+    return r[0], r[1]
+
+
+def due_errors(con, user_id, today):
+    return [r[0] for r in con.execute("SELECT question_id FROM error_queue WHERE user_id=? AND due<=? ORDER BY due, added",
+                                      (user_id, today.isoformat()))]
+
+
+# =====================================================================================
+#  Значки
+# =====================================================================================
+BADGE_COINS = 5     # монет за каждый новый значок
+BADGES = {
+    "first_quiz": ("🎯", "Первый квиз", "пройди свой первый квиз"),
+    "perfect": ("💯", "Идеальный квиз", "ответь верно на все вопросы квиза"),
+    "streak3": ("🔥", "Серия 3 дня", "занимайся 3 дня подряд"),
+    "streak7": ("🔥", "Серия 7 дней", "занимайся 7 дней подряд"),
+    "streak14": ("🔥", "Серия 14 дней", "занимайся 14 дней подряд"),
+    "streak30": ("🔥", "Серия 30 дней", "занимайся 30 дней подряд"),
+    "answers100": ("📝", "100 ответов", "дай 100 ответов"),
+    "answers500": ("📝", "500 ответов", "дай 500 ответов"),
+    "answers1000": ("📝", "1000 ответов", "дай 1000 ответов"),
+    "topics5": ("📚", "5 тем пройдено", "пройди 5 тем программы"),
+    "topics15": ("📚", "15 тем пройдено", "пройди 15 тем программы"),
+    "topics30": ("📚", "30 тем пройдено", "пройди 30 тем программы"),
+    "errors10": ("🔁", "Работа над ошибками", "исправь 10 ошибок: верно повтори их через несколько дней"),
+    "hw5": ("🏆", "5 домашек в срок", "сдай 5 заданий вовремя"),
+    "band_A2": ("🎓", "Уровень A2", "перейди на уровень A2"),
+    "band_B1": ("🎓", "Уровень B1", "перейди на уровень B1"),
+    "band_B2": ("🎓", "Уровень B2", "перейди на уровень B2"),
+    "band_C1": ("🎓", "Уровень C1", "перейди на уровень C1"),
+}
+
+
+def user_badges(con, user_id):
+    return {r["code"]: r["ts"] for r in con.execute("SELECT code, ts FROM badges WHERE user_id=?", (user_id,))}
+
+
+def check_badges(con, user_id, day, perfect=False):
+    """Проверяет условия и выдаёт новые значки (с монетами). Возвращает список кодов новых значков."""
+    have = user_badges(con, user_id)
+    ch = get_character(con, user_id)
+    if ch is None:
+        return []
+    earned = []
+
+    def grant(code):
+        if code in BADGES and code not in have:
+            con.execute("INSERT OR IGNORE INTO badges (user_id, code, ts) VALUES (?,?,?)", (user_id, code, utc_now()))
+            earned.append(code)
+            have[code] = "x"
+
+    one = lambda sql, *p: con.execute(sql, p).fetchone()[0]
+    if one("SELECT COUNT(*) FROM events WHERE user_id=? AND event_type='quiz_complete'", user_id):
+        grant("first_quiz")
+    if perfect:
+        grant("perfect")
+    streak = effective_streak(ch, day)
+    for n in (3, 7, 14, 30):
+        if streak >= n:
+            grant(f"streak{n}")
+    answers = one("SELECT COUNT(*) FROM events WHERE user_id=? AND event_type='answer'", user_id)
+    for n in (100, 500, 1000):
+        if answers >= n:
+            grant(f"answers{n}")
+    topics = one("SELECT COUNT(*) FROM student_topics WHERE user_id=? AND status='covered'", user_id)
+    for n in (5, 15, 30):
+        if topics >= n:
+            grant(f"topics{n}")
+    if one("SELECT COUNT(*) FROM events WHERE user_id=? AND event_type='error_fixed'", user_id) >= 10:
+        grant("errors10")
+    if one("SELECT COUNT(*) FROM homework_status WHERE user_id=? AND status='done' AND late=0", user_id) >= 5:
+        grant("hw5")
+    band = ch["band"] or cefr_for_level(ch["level"])
+    for c in CEFR[1:CEFR.index(band) + 1]:
+        grant(f"band_{c}")
+    con.commit()
+    for code in earned:
+        adjust(con, user_id, "coins", BADGE_COINS, f"Значок: {BADGES[code][1]}", None, day)
+    return earned
+
+
+# =====================================================================================
+#  Магазин призов
+# =====================================================================================
+def create_prize(con, title, price, stock=None, description=None):
+    cur = con.execute("INSERT INTO prizes (title, description, price, stock, created_at) VALUES (?,?,?,?,?)",
+                      (title, description, price, stock, utc_now()))
+    con.commit()
+    return cur.lastrowid
+
+
+def get_prize(con, prize_id):
+    return con.execute("SELECT * FROM prizes WHERE id=? AND deleted=0", (prize_id,)).fetchone()
+
+
+def list_prizes(con, only_active=False):
+    sql = "SELECT * FROM prizes WHERE deleted=0" + (" AND active=1 AND (stock IS NULL OR stock>0)" if only_active else "")
+    return con.execute(sql + " ORDER BY price, id").fetchall()
+
+
+def update_prize(con, prize_id, **fields):
+    allowed = ("title", "description", "price", "stock", "active", "deleted")
+    keys = [k for k in fields if k in allowed]
+    con.execute(f"UPDATE prizes SET {', '.join(k + '=?' for k in keys)} WHERE id=?", [fields[k] for k in keys] + [prize_id])
+    con.commit()
+
+
+def buy_prize(con, user_id, prize_id, day):
+    """Покупка за монеты. Возвращает (purchase_id, None) или (None, причина отказа)."""
+    p = get_prize(con, prize_id)
+    ch = get_character(con, user_id)
+    if not p or not p["active"]:
+        return None, "Этого приза уже нет в магазине."
+    if p["stock"] is not None and p["stock"] <= 0:
+        return None, "Этот приз закончился."
+    if ch["coins"] < p["price"]:
+        return None, f"Не хватает монет: нужно {p['price']}, у тебя {ch['coins']}."
+    con.execute("UPDATE characters SET coins=coins-? WHERE user_id=?", (p["price"], user_id))
+    if p["stock"] is not None:
+        con.execute("UPDATE prizes SET stock=stock-1 WHERE id=?", (prize_id,))
+    cur = con.execute("INSERT INTO purchases (user_id, prize_id, title, price, ts) VALUES (?,?,?,?,?)",
+                      (user_id, prize_id, p["title"], p["price"], utc_now()))
+    con.commit()
+    log_event(con, user_id, "purchase", day, extra=json.dumps({"prize": p["title"], "price": p["price"]}, ensure_ascii=False))
+    return cur.lastrowid, None
+
+
+def get_purchase(con, purchase_id):
+    return con.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+
+
+def finish_purchase(con, purchase_id, cancel=False):
+    """Выдан (done) или отменён с возвратом монет и приза на склад. Возвращает покупку или None, если уже обработана."""
+    p = get_purchase(con, purchase_id)
+    if not p or p["status"] != "new":
+        return None
+    if cancel:
+        con.execute("UPDATE characters SET coins=coins+? WHERE user_id=?", (p["price"], p["user_id"]))
+        con.execute("UPDATE prizes SET stock=stock+1 WHERE id=? AND stock IS NOT NULL", (p["prize_id"],))
+    con.execute("UPDATE purchases SET status=?, done_at=? WHERE id=?",
+                ("cancelled" if cancel else "done", utc_now(), purchase_id))
+    con.commit()
+    return get_purchase(con, purchase_id)
+
+
+def pending_purchases(con):
+    return con.execute("SELECT p.*, u.nickname FROM purchases p JOIN users u ON u.id=p.user_id "
+                       "WHERE p.status='new' ORDER BY p.id").fetchall()
+
+
+def user_purchases(con, user_id, limit=10):
+    return con.execute("SELECT * FROM purchases WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit)).fetchall()
